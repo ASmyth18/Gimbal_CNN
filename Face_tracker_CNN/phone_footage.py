@@ -1,10 +1,13 @@
 """ face_detector.py (freeze/unfreeze + facial landmarks + temporal-stabilized mask
-    + CSV track logging for gimbal control + sepia mono-colour)"""
+    + CSV track logging for gimbal control + sepia mono-colour)
+    Added: threaded MJPEG reader, per-track Kalman predictors, and CUDA/TensorRT backend attempt.
+"""
 import cv2
 import numpy as np
 import os
 import sys
 import time
+import threading
 import urllib.request
 from pathlib import Path
 import requests
@@ -18,6 +21,7 @@ SNAPSHOT_URL = "http://192.168.2.164:8080/shot.jpg"       # fallback snapshot en
 MODEL_DIR = "models/face_detector"
 PROTOTXT = os.path.join(MODEL_DIR, "deploy.prototxt")
 CAFFEMODEL = os.path.join(MODEL_DIR, "res10_300x300_ssd_iter_140000.caffemodel")
+ONNX_MODEL = os.path.join(MODEL_DIR, "retinaface.onnx")    # optional better ONNX detector
 LBF_MODEL = os.path.join(MODEL_DIR, "lbfmodel.yaml")   # facemark LBF model (optional)
 CONF_THRESHOLD = 0.5
 
@@ -33,6 +37,10 @@ BBOX_EMA_ALPHA = 0.6          # bbox smoothing factor (higher -> slower)
 TRACK_DROP_FRAMES = 12        # how many frames to keep a track without detections
 IOU_MATCH_THRESH = 0.25       # IoU threshold for matching detections to existing tracks
 
+# Kalman settings
+KF_PROCESS_NOISE = 1e-2
+KF_MEAS_NOISE = 1e-1
+
 # CSV logging settings
 LOG_ENABLED = True
 LOG_PATH = "tracks_log.csv"
@@ -46,9 +54,8 @@ CAFFEMODEL_URL = (
 )
 LBF_MODEL_URL = "https://raw.githubusercontent.com/kurnianggoro/GSOC2017/master/data/lbfmodel.yaml"
 
-
 # --- Clear CSV at start of session ---
-with open("tracks_log.csv", "w", newline="") as f:
+with open(LOG_PATH, "w", newline="") as f:
     writer = csv.writer(f)
     writer.writerow([
         "timestamp_utc_iso", "frame_idx", "track_id",
@@ -59,9 +66,8 @@ with open("tracks_log.csv", "w", newline="") as f:
     ])
 print("CSV log cleared — fresh session started.")
 
-
 # --- global tracking & state ---
-tracks = {}  # id -> track dict
+tracks = {}  # id -> track dict (contains 'kf' when available)
 _next_track_id = 0
 frozen = False  # freeze/unfreeze toggle
 use_facemark = False
@@ -74,11 +80,13 @@ SEPIA_KERNEL_BGR = np.array([
     [0.189, 0.769, 0.393],  # R'
 ], dtype=np.float32)
 
+
 def _next_id():
     global _next_track_id
     tid = _next_track_id
     _next_track_id += 1
     return tid
+
 
 def download_stream(url, dest_path):
     dest = Path(dest_path)
@@ -108,6 +116,7 @@ def download_stream(url, dest_path):
             dest.unlink()
         return False
 
+
 def ensure_model_files():
     ok = True
     if not os.path.exists(PROTOTXT):
@@ -116,19 +125,70 @@ def ensure_model_files():
         ok = download_stream(CAFFEMODEL_URL, CAFFEMODEL) and ok
     return ok
 
+
 def download_lbf_if_needed():
     if not os.path.exists(LBF_MODEL):
         print("LBF facemark model not found locally. Attempting to download...")
         return download_stream(LBF_MODEL_URL, LBF_MODEL)
     return True
 
+
 def load_dnn_detector():
+    """
+    Try to load a higher-performance ONNX model (if present) first, otherwise fall back to
+    the original Caffe SSD res10. Returns (net, model_type) where model_type is 'onnx' or 'caffe'.
+    """
+    # Prefer ONNX file if present (user may place a RetinaFace or other ONNX here)
+    if os.path.exists(ONNX_MODEL):
+        try:
+            print(f"Loading ONNX model from {ONNX_MODEL} ...")
+            net = cv2.dnn.readNetFromONNX(ONNX_MODEL)
+            print("Loaded ONNX model.")
+            return net, "onnx"
+        except Exception as e:
+            print("Failed to load ONNX model:", e)
+            # fallthrough to caffe
+    # fall back to Caffe SSD res10
     try:
         net = cv2.dnn.readNetFromCaffe(PROTOTXT, CAFFEMODEL)
-        return net
+        return net, "caffe"
     except Exception as e:
-        print(f"Failed to load DNN model: {e}")
-        return None
+        print(f"Failed to load DNN model (Caffe): {e}")
+        return None, None
+
+
+def configure_dnn_backend(net):
+    """
+    Attempt to set the DNN backend/target to use CUDA / TensorRT if available.
+    This is a best-effort step: it will succeed only if the OpenCV build + drivers support it.
+    """
+    try:
+        cuda_count = 0
+        if hasattr(cv2, "cuda"):
+            try:
+                cuda_count = cv2.cuda.getCudaEnabledDeviceCount()
+            except Exception:
+                cuda_count = 0
+        if cuda_count > 0:
+            # prefer FP16 target if available (many builds that support TensorRT expose CUDA_FP16)
+            try:
+                net.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
+                # try FP16 target first (may use TensorRT in some builds)
+                net.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA_FP16)
+                print("DNN backend set to CUDA, target set to CUDA_FP16 (TensorRT path if available).")
+            except Exception as e1:
+                try:
+                    net.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
+                    net.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
+                    print("DNN backend set to CUDA, target set to CUDA.")
+                except Exception as e2:
+                    print("Could not set CUDA backend/target for DNN:", e1, e2)
+                    print("Falling back to CPU backend.")
+        else:
+            print("No CUDA device detected or OpenCV CUDA module unavailable. Using default (CPU) backend.")
+    except Exception as e:
+        print("Error while configuring DNN backend:", e)
+
 
 def load_haar_detector():
     haar_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
@@ -136,6 +196,7 @@ def load_haar_detector():
         cascade = cv2.CascadeClassifier(haar_path)
         return cascade
     return None
+
 
 def try_load_facemark():
     """
@@ -164,6 +225,7 @@ def try_load_facemark():
         use_facemark = False
         return None
 
+
 def grab_snapshot_frame(url, timeout=5):
     """Return BGR frame from a JPEG snapshot URL or None on failure."""
     try:
@@ -175,6 +237,135 @@ def grab_snapshot_frame(url, timeout=5):
     except Exception:
         return None
 
+
+# ----------------- MJPEG threaded reader -----------------
+class MJPEGStream:
+    """
+    Threaded MJPEG stream reader.
+    Usage:
+        s = MJPEGStream("http://192.168.2.164:8080/video?x.mjpg")
+        s.start()
+        frame = s.read()   # returns most recent frame (BGR) or None
+        s.stop()
+    """
+    def __init__(self, url, timeout=10, reconnect_delay=1.0):
+        self.url = url
+        self.timeout = timeout
+        self.reconnect_delay = reconnect_delay
+        self._running = False
+        self._thread = None
+        self._frame = None
+        self._lock = threading.Lock()
+        self.session = None
+
+        # fps meter
+        self._frames_count = 0
+        self._fps = 0.0
+        self._fps_ts = time.time()
+
+    def start(self):
+        if self._running:
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        while self._running:
+            try:
+                self.session = requests.Session()
+                with self.session.get(self.url, stream=True, timeout=self.timeout) as resp:
+                    if resp.status_code != 200:
+                        time.sleep(self.reconnect_delay)
+                        continue
+
+                    bytes_buf = b''
+                    for chunk in resp.iter_content(chunk_size=8192):
+                        if not self._running:
+                            break
+                        if chunk:
+                            bytes_buf += chunk
+                            start = bytes_buf.find(b'\xff\xd8')
+                            end = bytes_buf.find(b'\xff\xd9', start + 2) if start != -1 else -1
+                            if start != -1 and end != -1:
+                                jpg = bytes_buf[start:end+2]
+                                bytes_buf = bytes_buf[end+2:]
+                                arr = np.frombuffer(jpg, dtype=np.uint8)
+                                img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                                if img is not None:
+                                    with self._lock:
+                                        self._frame = img
+                                    # fps calc
+                                    self._frames_count += 1
+                                    now = time.time()
+                                    if now - self._fps_ts >= 1.0:
+                                        self._fps = self._frames_count / (now - self._fps_ts)
+                                        self._frames_count = 0
+                                        self._fps_ts = now
+            except Exception:
+                time.sleep(self.reconnect_delay)
+            finally:
+                try:
+                    if self.session is not None:
+                        self.session.close()
+                        self.session = None
+                except Exception:
+                    pass
+
+    def read(self):
+        with self._lock:
+            if self._frame is None:
+                return None
+            return self._frame.copy()
+
+    def stop(self):
+        self._running = False
+        try:
+            if self.session is not None:
+                self.session.close()
+        except Exception:
+            pass
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+            self._thread = None
+
+    def fps(self):
+        return self._fps
+
+
+# ----------------- Kalman helper -----------------
+def create_kalman_for_bbox(bbox):
+    """
+    Create an OpenCV KalmanFilter for bbox tracking.
+    State: [cx, cy, w, h, vx, vy, vw, vh]^T  (8)
+    Measurement: [cx, cy, w, h]^T (4)
+    """
+    kf = cv2.KalmanFilter(8, 4)
+    # Transition matrix
+    kf.transitionMatrix = np.eye(8, dtype=np.float32)
+    for i in range(4):
+        kf.transitionMatrix[i, i+4] = 1.0
+    # Measurement matrix: measure first 4 states
+    kf.measurementMatrix = np.zeros((4, 8), dtype=np.float32)
+    kf.measurementMatrix[0, 0] = 1.0
+    kf.measurementMatrix[1, 1] = 1.0
+    kf.measurementMatrix[2, 2] = 1.0
+    kf.measurementMatrix[3, 3] = 1.0
+    # Noise covariances
+    kf.processNoiseCov = np.eye(8, dtype=np.float32) * KF_PROCESS_NOISE
+    kf.measurementNoiseCov = np.eye(4, dtype=np.float32) * KF_MEAS_NOISE
+    kf.errorCovPost = np.eye(8, dtype=np.float32) * 1.0
+
+    x1, y1, x2, y2 = bbox
+    cx = float((x1 + x2) / 2.0)
+    cy = float((y1 + y2) / 2.0)
+    w = float(max(1.0, x2 - x1))
+    h = float(max(1.0, y2 - y1))
+    state = np.array([cx, cy, w, h, 0, 0, 0, 0], dtype=np.float32).reshape(-1, 1)
+    kf.statePost = state.copy()
+    return kf
+
+
 # ----------------- mask/edge refinement helpers -----------------
 def _auto_canny_thresholds(gray, sigma=0.33):
     v = np.median(gray)
@@ -183,6 +374,7 @@ def _auto_canny_thresholds(gray, sigma=0.33):
     if lower >= upper:
         lower = max(0, upper - 1)
     return lower, upper
+
 
 def refine_face_mask(roi_bgr):
     """
@@ -210,6 +402,7 @@ def refine_face_mask(roi_bgr):
     mask_blurred = cv2.GaussianBlur(mask, MASK_BLUR_KERNEL, 0)
     edge_overlay = cv2.dilate(edges_closed, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3)), iterations=1)
     return mask_blurred, edge_overlay
+
 
 def mask_from_landmarks(landmarks, bbox):
     """
@@ -245,6 +438,7 @@ def mask_from_landmarks(landmarks, bbox):
     edges = cv2.dilate(edges, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3)), iterations=1)
     return mask_blurred, edges
 
+
 # ----------------- tracking helpers -----------------
 def iou(boxA, boxB):
     # boxes: (x1,y1,x2,y2)
@@ -262,7 +456,12 @@ def iou(boxA, boxB):
         return 0.0
     return interArea / union
 
+
 def match_detections_to_tracks(detections, current_tracks):
+    """
+    Match detections to existing tracks using predicted bbox if available (track['bbox_pred']),
+    otherwise use bbox_smoothed. Returns mapping list of track ids or None.
+    """
     mapping = [None] * len(detections)
     if not current_tracks:
         return mapping
@@ -273,7 +472,10 @@ def match_detections_to_tracks(detections, current_tracks):
         for tid, tr in current_tracks.items():
             if tid in used_tracks:
                 continue
-            i = iou(det['box'], tr['bbox_smoothed'])
+            ref_box = tr.get('bbox_pred', tr.get('bbox_smoothed'))
+            if ref_box is None:
+                continue
+            i = iou(det['box'], ref_box)
             if i > best_iou:
                 best_iou = i
                 best_tid = tid
@@ -281,6 +483,7 @@ def match_detections_to_tracks(detections, current_tracks):
             mapping[d_idx] = best_tid
             used_tracks.add(best_tid)
     return mapping
+
 
 def create_fullframe_mask(frame_h, frame_w, bbox, local_mask):
     x1, y1, x2, y2 = bbox
@@ -299,7 +502,12 @@ def create_fullframe_mask(frame_h, frame_w, bbox, local_mask):
     full[y1c:y2c, x1c:x2c] = resized
     return full
 
+
 def update_or_create_track(track_id, det, frame_h, frame_w):
+    """
+    If track_id is None -> create new track with Kalman filter.
+    Else update smoothed bbox and correct Kalman with measurement.
+    """
     if track_id is None:
         tid = _next_id()
         bbox = det['box']
@@ -310,6 +518,13 @@ def update_or_create_track(track_id, det, frame_h, frame_w):
             'last_seen': 0,
             'confidence': det.get('confidence', 1.0),
         }
+        # create Kalman and store
+        try:
+            kf = create_kalman_for_bbox(bbox)
+            track['kf'] = kf
+        except Exception:
+            track['kf'] = None
+
         mask_full = create_fullframe_mask(frame_h, frame_w, bbox, det['mask_local'])
         edges_full = create_fullframe_mask(frame_h, frame_w, bbox, det['edges_local'])
         track['masks'].append(mask_full)
@@ -318,7 +533,7 @@ def update_or_create_track(track_id, det, frame_h, frame_w):
         return tid
     else:
         tr = tracks[track_id]
-        x1,y1,x2,y2 = det['box']
+        x1, y1, x2, y2 = det['box']
         bx1, by1, bx2, by2 = tr['bbox_smoothed']
         nbx1 = int(BBOX_EMA_ALPHA * bx1 + (1.0 - BBOX_EMA_ALPHA) * x1)
         nby1 = int(BBOX_EMA_ALPHA * by1 + (1.0 - BBOX_EMA_ALPHA) * y1)
@@ -331,7 +546,21 @@ def update_or_create_track(track_id, det, frame_h, frame_w):
         tr['edges'].append(edges_full)
         tr['last_seen'] = 0
         tr['confidence'] = det.get('confidence', tr.get('confidence', 1.0))
+
+        # correct the Kalman filter with measurement (cx,cy,w,h)
+        if 'kf' in tr and tr['kf'] is not None:
+            cx = float((x1 + x2) / 2.0)
+            cy = float((y1 + y2) / 2.0)
+            w = float(max(1.0, x2 - x1))
+            h = float(max(1.0, y2 - y1))
+            meas = np.array([cx, cy, w, h], dtype=np.float32).reshape(4, 1)
+            try:
+                tr['kf'].correct(meas)
+            except Exception:
+                pass
+
         return track_id
+
 
 def garbage_collect_tracks():
     to_delete = []
@@ -342,28 +571,55 @@ def garbage_collect_tracks():
     for tid in to_delete:
         del tracks[tid]
 
+
 # ----------------- main processing -----------------
 def apply_sepia_to_frame(frame):
     """
     Apply sepia tint to a BGR frame using SEPIA_KERNEL_BGR via cv2.transform.
     Returns uint8 BGR image clipped to [0,255].
     """
-    # cv2.transform expects float32
     transformed = cv2.transform(frame.astype(np.float32), SEPIA_KERNEL_BGR)
     transformed = np.clip(transformed, 0, 255).astype(np.uint8)
     return transformed
+
 
 def process_and_draw(frame, net, cascade, use_haar, frozen_flag=False, log_writer=None, log_file=None, frame_idx=None):
     """
     Detect faces this frame, create local masks, match to tracks, update tracks,
     then apply averaged masks from tracks to the frame to produce sepia-tinted faces.
     Also logs track positions to CSV if log_writer provided.
+    Uses per-track Kalman filter predictions for matching.
     """
     frame_h, frame_w = frame.shape[:2]
     detections = []
 
+    # ---------- predict step for all existing tracks ----------
+    for tid, tr in list(tracks.items()):
+        if 'kf' in tr and tr['kf'] is not None:
+            try:
+                pred = tr['kf'].predict()  # (8,1)
+                pcx = float(pred[0, 0])
+                pcy = float(pred[1, 0])
+                pw = float(max(1.0, pred[2, 0]))
+                ph = float(max(1.0, pred[3, 0]))
+                px1 = int(pcx - pw / 2.0)
+                py1 = int(pcy - ph / 2.0)
+                px2 = int(pcx + pw / 2.0)
+                py2 = int(pcy + ph / 2.0)
+                # clip to frame
+                px1 = max(0, min(frame_w - 1, px1))
+                py1 = max(0, min(frame_h - 1, py1))
+                px2 = max(0, min(frame_w - 1, px2))
+                py2 = max(0, min(frame_h - 1, py2))
+                tr['bbox_pred'] = (px1, py1, px2, py2)
+            except Exception:
+                tr['bbox_pred'] = tr.get('bbox_smoothed')
+        else:
+            tr['bbox_pred'] = tr.get('bbox_smoothed')
+
     if not frozen_flag:
-        if not use_haar:
+        if not use_haar and net is not None:
+            # standard DNN forward
             blob = cv2.dnn.blobFromImage(cv2.resize(frame, (300, 300)),
                                          1.0, (300, 300),
                                          (104.0, 177.0, 123.0), swapRB=False, crop=False)
@@ -371,52 +627,107 @@ def process_and_draw(frame, net, cascade, use_haar, frozen_flag=False, log_write
             try:
                 dets = net.forward()
             except Exception as e:
+                # If ONNX retinaface or other model has different output layout,
+                # it's possible the model needs custom postprocessing; fallback gracefully.
                 print(f"DNN forward error: {e}")
                 dets = None
             if dets is not None:
-                for i in range(0, dets.shape[2]):
-                    confidence = float(dets[0, 0, i, 2])
-                    if confidence < CONF_THRESHOLD:
-                        continue
-                    box = dets[0, 0, i, 3:7] * np.array([frame_w, frame_h, frame_w, frame_h])
-                    sx, sy, ex, ey = box.astype("int")
-                    bw = ex - sx
-                    bh = ey - sy
-                    mx = int(bw * FACE_MARGIN)
-                    my = int(bh * FACE_MARGIN)
-                    startX = max(0, sx - mx)
-                    startY = max(0, sy - my)
-                    endX = min(frame_w - 1, ex + mx)
-                    endY = min(frame_h - 1, ey + my)
-                    if endX - startX < 10 or endY - startY < 10:
-                        continue
-                    roi = frame[startY:endY, startX:endX].copy()
+                # handle classic SSD output layout (if used)
+                if dets.ndim == 4 and dets.shape[1] == 1 and dets.shape[2] > 0:
+                    for i in range(0, dets.shape[2]):
+                        confidence = float(dets[0, 0, i, 2])
+                        if confidence < CONF_THRESHOLD:
+                            continue
+                        box = dets[0, 0, i, 3:7] * np.array([frame_w, frame_h, frame_w, frame_h])
+                        sx, sy, ex, ey = box.astype("int")
+                        bw = ex - sx
+                        bh = ey - sy
+                        mx = int(bw * FACE_MARGIN)
+                        my = int(bh * FACE_MARGIN)
+                        startX = max(0, sx - mx)
+                        startY = max(0, sy - my)
+                        endX = min(frame_w - 1, ex + mx)
+                        endY = min(frame_h - 1, ey + my)
+                        if endX - startX < 10 or endY - startY < 10:
+                            continue
+                        roi = frame[startY:endY, startX:endX].copy()
 
-                    # try landmarks first (if available)
-                    if use_facemark and facemark is not None:
-                        try:
-                            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                            rect = np.array([[startX, startY, endX - startX, endY - startY]], dtype=np.int32)
-                            ok, shapes = facemark.fit(gray, rect)
-                            if ok and shapes and len(shapes) > 0:
-                                lm = shapes[0].reshape(-1, 2)
-                                mask_local, edges_local = mask_from_landmarks(lm, (startX, startY, endX, endY))
-                                if mask_local is None:
+                        # try landmarks first (if available)
+                        if use_facemark and facemark is not None:
+                            try:
+                                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                                rect = np.array([[startX, startY, endX - startX, endY - startY]], dtype=np.int32)
+                                ok, shapes = facemark.fit(gray, rect)
+                                if ok and shapes and len(shapes) > 0:
+                                    lm = shapes[0].reshape(-1, 2)
+                                    mask_local, edges_local = mask_from_landmarks(lm, (startX, startY, endX, endY))
+                                    if mask_local is None:
+                                        mask_local, edges_local = refine_face_mask(roi)
+                                else:
+                                    mask_local, edges_local = refine_face_mask(roi)
+                            except Exception:
+                                mask_local, edges_local = refine_face_mask(roi)
+                        else:
+                            mask_local, edges_local = refine_face_mask(roi)
+
+                        detections.append({
+                            'box': (startX, startY, endX, endY),
+                            'confidence': confidence,
+                            'mask_local': mask_local,
+                            'edges_local': edges_local
+                        })
+                else:
+                    # If the ONNX model returns a different layout (e.g., RetinaFace), try a common parsing:
+                    # RetinaFace-like: detections may be Nx6 (x1,y1,x2,y2,score,...) or similar.
+                    # Try to interpret rows as [x1,y1,x2,y2,score,...] if dims match.
+                    if dets.ndim == 2 and dets.shape[1] >= 5:
+                        for row in dets:
+                            score = float(row[4])
+                            if score < CONF_THRESHOLD:
+                                continue
+                            sx = int(row[0] * frame_w) if row[0] <= 1.0 else int(row[0])
+                            sy = int(row[1] * frame_h) if row[1] <= 1.0 else int(row[1])
+                            ex = int(row[2] * frame_w) if row[2] <= 1.0 else int(row[2])
+                            ey = int(row[3] * frame_h) if row[3] <= 1.0 else int(row[3])
+                            bw = ex - sx
+                            bh = ey - sy
+                            mx = int(bw * FACE_MARGIN)
+                            my = int(bh * FACE_MARGIN)
+                            startX = max(0, sx - mx)
+                            startY = max(0, sy - my)
+                            endX = min(frame_w - 1, ex + mx)
+                            endY = min(frame_h - 1, ey + my)
+                            if endX - startX < 10 or endY - startY < 10:
+                                continue
+                            roi = frame[startY:endY, startX:endX].copy()
+                            if use_facemark and facemark is not None:
+                                try:
+                                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                                    rect = np.array([[startX, startY, endX - startX, endY - startY]], dtype=np.int32)
+                                    ok, shapes = facemark.fit(gray, rect)
+                                    if ok and shapes and len(shapes) > 0:
+                                        lm = shapes[0].reshape(-1, 2)
+                                        mask_local, edges_local = mask_from_landmarks(lm, (startX, startY, endX, endY))
+                                        if mask_local is None:
+                                            mask_local, edges_local = refine_face_mask(roi)
+                                    else:
+                                        mask_local, edges_local = refine_face_mask(roi)
+                                except Exception:
                                     mask_local, edges_local = refine_face_mask(roi)
                             else:
                                 mask_local, edges_local = refine_face_mask(roi)
-                        except Exception:
-                            mask_local, edges_local = refine_face_mask(roi)
+                            detections.append({
+                                'box': (startX, startY, endX, endY),
+                                'confidence': score,
+                                'mask_local': mask_local,
+                                'edges_local': edges_local
+                            })
                     else:
-                        mask_local, edges_local = refine_face_mask(roi)
+                        # unknown output shape — skip detection this frame
+                        pass
 
-                    detections.append({
-                        'box': (startX, startY, endX, endY),
-                        'confidence': confidence,
-                        'mask_local': mask_local,
-                        'edges_local': edges_local
-                    })
         else:
+            # Haar fallback
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5,
                                              minSize=(30, 30), flags=cv2.CASCADE_SCALE_IMAGE)
@@ -454,7 +765,7 @@ def process_and_draw(frame, net, cascade, use_haar, frozen_flag=False, log_write
                     'edges_local': edges_local
                 })
 
-        # match detections to existing tracks
+        # ---- matching using predicted bboxes ----
         mapping = match_detections_to_tracks(detections, tracks)
         used_track_ids = set()
         for d_idx, det in enumerate(detections):
@@ -527,6 +838,7 @@ def process_and_draw(frame, net, cascade, use_haar, frozen_flag=False, log_write
     garbage_collect_tracks()
     return output
 
+
 def main():
     global frozen
     # ensure DNN model files (attempt download if missing)
@@ -538,8 +850,12 @@ def main():
         dnn_ok = True
 
     net = None
+    model_type = None
     if dnn_ok:
-        net = load_dnn_detector()
+        net, model_type = load_dnn_detector()
+
+    if net is not None:
+        configure_dnn_backend(net)
 
     use_haar = False
     cascade = None
@@ -551,7 +867,7 @@ def main():
             sys.exit(1)
         use_haar = True
     else:
-        print("Using DNN (SSD res10) face detector.")
+        print(f"Using DNN face detector ({model_type}).")
 
     # try facemark
     try_load_facemark()
@@ -578,11 +894,26 @@ def main():
             log_writer = None
 
     print(f"Attempting to open stream: {VIDEO_SOURCE}")
-    cap = cv2.VideoCapture(VIDEO_SOURCE, cv2.CAP_FFMPEG)
+
+    # start threaded MJPEG stream
+    stream = MJPEGStream(VIDEO_SOURCE, timeout=10, reconnect_delay=1.0)
+    stream.start()
+
+    # wait a short while for the stream to produce frames, otherwise fallback to snapshot polling
     use_snapshot_fallback = False
-    if not cap.isOpened():
-        print("VideoCapture failed to open MJPEG stream. Falling back to snapshot polling.")
+    first_wait_start = time.time()
+    first_frame = None
+    while time.time() - first_wait_start < 2.5:
+        first_frame = stream.read()
+        if first_frame is not None:
+            break
+        time.sleep(0.05)
+    if first_frame is None:
+        print("MJPEG stream did not produce frames — falling back to snapshot polling.")
         use_snapshot_fallback = True
+    else:
+        print("MJPEG stream active (threaded reader) — using stream frames.")
+        use_snapshot_fallback = False
 
     frame_idx = 0
     try:
@@ -590,11 +921,19 @@ def main():
             if use_snapshot_fallback:
                 frame = grab_snapshot_frame(SNAPSHOT_URL)
                 if frame is None:
-                    time.sleep(0.1)
-                    continue
+                    # keep trying stream as well in case it recovers
+                    maybe = stream.read()
+                    if maybe is not None:
+                        frame = maybe
+                        use_snapshot_fallback = False
+                        print("MJPEG stream recovered — switching back to stream.")
+                    else:
+                        time.sleep(0.03)
+                        continue
             else:
-                ret, frame = cap.read()
-                if not ret or frame is None:
+                frame = stream.read()
+                if frame is None:
+                    # stream dropped; switch to snapshot fallback but keep trying to reconnect in background
                     print("Stream dropped or no frame received — switching to snapshot fallback.")
                     use_snapshot_fallback = True
                     continue
@@ -623,8 +962,11 @@ def main():
                 print("Cleared all tracks.")
 
     finally:
-        if not use_snapshot_fallback:
-            cap.release()
+        # stop threaded stream
+        try:
+            stream.stop()
+        except Exception:
+            pass
         cv2.destroyAllWindows()
         if log_file is not None:
             try:
@@ -632,5 +974,7 @@ def main():
             except Exception:
                 pass
 
+
 if __name__ == "__main__":
     main()
+
