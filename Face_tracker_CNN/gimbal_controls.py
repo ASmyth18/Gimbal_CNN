@@ -36,7 +36,7 @@ except Exception:
 
 # -------------------- Defaults / tuning --------------------
 DEFAULT_CSV = "tracks_log.csv"
-DEFAULT_HFOV_DEG = 62.0   # horizontal field of view of camera in degrees (tweak to your camera)
+DEFAULT_HFOV_DEG = 62.0   # horizontal field of view of camera in degrees (tweak to camera)
 DEFAULT_VFOV_DEG = 44.0   # vertical field of view in degrees
 DEFAULT_FRAME_W = 640     # resolution used by detector (set to match detector)
 DEFAULT_FRAME_H = 480
@@ -325,3 +325,4 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
     run_tracker(args)
+
