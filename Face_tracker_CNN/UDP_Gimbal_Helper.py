@@ -1,5 +1,5 @@
 """
-Simple UDP helper: listens for face_detector.py UDP telemetry and converts pixel -> yaw/pitch angles.
+Simple UDP helper: listens for phone_footage.py UDP telemetry and converts pixel -> yaw/pitch angles.
 Usage example:
   python udp_gimbal_helper.py --listen-port 22345 --use-fov --hfov 62 --vfov 44
 """
