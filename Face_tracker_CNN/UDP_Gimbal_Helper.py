@@ -1,7 +1,7 @@
 """
 Simple UDP helper: listens for phone_footage.py UDP telemetry and converts pixel -> yaw/pitch angles.
 Usage example:
-  python udp_gimbal_helper.py --listen-port 22345 --use-fov --hfov 62 --vfov 44
+  python UDP_Gimbal_Helper.py --listen-port 22345 --use-fov --hfov 62 --vfov 44
 """
 import socket, json, argparse, time, math
 
