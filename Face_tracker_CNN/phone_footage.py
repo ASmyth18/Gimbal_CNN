@@ -1,6 +1,13 @@
-""" face_detector.py (freeze/unfreeze + facial landmarks + temporal-stabilized mask
-    + CSV track logging for gimbal control + sepia mono-colour)
-    Added: threaded MJPEG reader, per-track Kalman predictors, and CUDA/TensorRT backend attempt.
+"""
+Face detector + tracker with:
+ - ONNX (GPU) inference fallback to Caffe
+ - threaded MJPEG reader
+ - per-track Kalman + mask smoothing + sparse-LK mask warp for large frames
+ - sepia mask rendering with confidence smoothing + hysteresis
+ - head-pose estimation (solvePnP) using facemark 68-landmarks when available
+ - HUD showing stream FPS, processing FPS and inference latency
+ - UDP telemetry includes head pose per track
+ - Visual overlay showing per-track yaw/pitch (and small yaw arrow)
 """
 import cv2
 import numpy as np
@@ -14,78 +21,157 @@ import requests
 from collections import deque
 import csv
 from datetime import datetime, timezone
+import socket
+import json
+import math
 
-# ========== User settings ==========
-VIDEO_SOURCE = "http://192.168.2.164:8080/video?x.mjpg"   # preferred MJPEG endpoint
-SNAPSHOT_URL = "http://192.168.2.164:8080/shot.jpg"       # fallback snapshot endpoint
+# ONNX runtime
+try:
+    import onnxruntime as ort
+except Exception:
+    ort = None
+
+# ========== Settings ==========
+VIDEO_SOURCE = "http://192.168.2.164:8080/video?x.mjpg"
+SNAPSHOT_URL = "http://192.168.2.164:8080/shot.jpg"
 MODEL_DIR = "models/face_detector"
 PROTOTXT = os.path.join(MODEL_DIR, "deploy.prototxt")
 CAFFEMODEL = os.path.join(MODEL_DIR, "res10_300x300_ssd_iter_140000.caffemodel")
-ONNX_MODEL = os.path.join(MODEL_DIR, "retinaface.onnx")    # optional better ONNX detector
-LBF_MODEL = os.path.join(MODEL_DIR, "lbfmodel.yaml")   # facemark LBF model (optional)
+ONNX_MODEL = os.path.join(MODEL_DIR, "retinaface.onnx")
+LBF_MODEL = os.path.join(MODEL_DIR, "lbfmodel.yaml")
 CONF_THRESHOLD = 0.5
 
-# Face mask/edge tuning (tweak these if needed)
-FACE_MARGIN = 0.18            # expand bbox by this fraction to include hair/outline
+FACE_MARGIN = 0.18
 BILATERAL_D = 9
 BILATERAL_SIGMA_COLOR = 75
 BILATERAL_SIGMA_SPACE = 75
-EDGE_KERNEL_SIZE = (7, 7)     # morphological close kernel
-MASK_BLUR_KERNEL = (15, 15)   # blur mask for smooth blend
-MASK_HISTORY = 6              # number of past masks to average per track
-BBOX_EMA_ALPHA = 0.6          # bbox smoothing factor (higher -> slower)
-TRACK_DROP_FRAMES = 12        # how many frames to keep a track without detections
-IOU_MATCH_THRESH = 0.25       # IoU threshold for matching detections to existing tracks
+EDGE_KERNEL_SIZE = (7, 7)
+MASK_BLUR_KERNEL = (15, 15)
+MASK_HISTORY = 6
+BBOX_EMA_ALPHA = 0.6
+TRACK_DROP_FRAMES = 12
+IOU_MATCH_THRESH = 0.25
 
-# Kalman settings
 KF_PROCESS_NOISE = 1e-2
 KF_MEAS_NOISE = 1e-1
 
-# CSV logging settings
+CONF_ALPHA = 0.92
+MASK_ENABLE_THRESH = 0.70
+MASK_DISABLE_THRESH = 0.55
+MASK_DISABLE_HOLD = 6
+
+# Flow / sparse-LK selection
+FLOW_PYRAMID_SCALE = 0.5
+FLOW_LEVELS = 2
+FLOW_WINSIZE = 15
+FLOW_ITER = 3
+FLOW_POLY_N = 5
+FLOW_POLY_SIGMA = 1.2
+FLOW_FLAGS = 0
+
+# switch to sparse-LK when frame area > this (pixels)
+SPARSE_LK_FRAME_AREA_THRESH = 640 * 480  # use sparse-LK for frames larger than VGA area
+SPARSE_LK_MAX_CORNERS = 100
+SPARSE_LK_QUALITY = 0.01
+SPARSE_LK_MIN_DIST = 7
+SPARSE_LK_WIN_SIZE = (21, 21)
+SPARSE_LK_MAX_LEVEL = 3
+
+# UDP telemetry
+UDP_ENABLED = True
+UDP_HOST = "127.0.0.1"
+UDP_PORT = 22345
+
 LOG_ENABLED = True
 LOG_PATH = "tracks_log.csv"
+
+# HUD smoothing
+HUD_ALPHA = 0.85
+
+# 3D model points for head-pose (units arbitrary, consistent)
+FACE_3D_MODEL = np.array([
+    (0.0, 0.0, 0.0),          # nose tip
+    (0.0, -330.0, -65.0),     # chin
+    (-225.0, 170.0, -135.0),  # left eye left corner
+    (225.0, 170.0, -135.0),   # right eye right corner
+    (-150.0, -150.0, -125.0), # left mouth corner
+    (150.0, -150.0, -125.0)   # right mouth corner
+], dtype=np.float32)
+LANDMARK_IDX = {
+    'nose_tip': 30,
+    'chin': 8,
+    'left_eye_outer': 36,
+    'right_eye_outer': 45,
+    'mouth_left': 48,
+    'mouth_right': 54
+}
 # ===================================
 
-PROTOTXT_URL = (
-    "https://raw.githubusercontent.com/opencv/opencv/3.4.0/samples/dnn/face_detector/deploy.prototxt"
-)
-CAFFEMODEL_URL = (
-    "https://raw.githubusercontent.com/opencv/opencv_3rdparty/dnn_samples_face_detector_20170830/res10_300x300_ssd_iter_140000.caffemodel"
-)
+PROTOTXT_URL = "https://raw.githubusercontent.com/opencv/opencv/3.4.0/samples/dnn/face_detector/deploy.prototxt"
+CAFFEMODEL_URL = "https://raw.githubusercontent.com/opencv/opencv_3rdparty/dnn_samples_face_detector_20170830/res10_300x300_ssd_iter_140000.caffemodel"
 LBF_MODEL_URL = "https://raw.githubusercontent.com/kurnianggoro/GSOC2017/master/data/lbfmodel.yaml"
 
-# --- Clear CSV at start of session ---
+# Clear CSV at start
 with open(LOG_PATH, "w", newline="") as f:
-    writer = csv.writer(f)
-    writer.writerow([
+    w = csv.writer(f)
+    w.writerow([
         "timestamp_utc_iso", "frame_idx", "track_id",
         "x1", "y1", "x2", "y2",
         "centroid_x", "centroid_y",
         "width", "height", "confidence",
+        "pose_yaw_deg", "pose_pitch_deg", "pose_roll_deg",
         "frozen_flag"
     ])
-print("CSV log cleared — fresh session started.")
+print("CSV cleared — fresh session.")
 
-# --- global tracking & state ---
-tracks = {}  # id -> track dict (contains 'kf' when available)
+# UDP socket
+udp_sock = None
+if UDP_ENABLED:
+    try:
+        udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        udp_sock.setblocking(False)
+        print(f"UDP telemetry -> {UDP_HOST}:{UDP_PORT}")
+    except Exception as e:
+        udp_sock = None
+        print("UDP socket failed:", e)
+
+# Globals
+tracks = {}
 _next_track_id = 0
-frozen = False  # freeze/unfreeze toggle
+frozen = False
 use_facemark = False
 facemark = None
+_prev_gray = None
 
-# Sepia transform kernel for BGR (cv2.transform expects src BGR order)
-SEPIA_KERNEL_BGR = np.array([
-    [0.131, 0.534, 0.272],  # B' = 0.272*R + 0.534*G + 0.131*B  (reordered for BGR)
-    [0.168, 0.686, 0.349],  # G'
-    [0.189, 0.769, 0.393],  # R'
-], dtype=np.float32)
+# HUD stats
+_stream_fps = 0.0
+_proc_fps = 0.0
+_avg_infer_ms = 0.0
 
+# Detector handles
+onnx_session = None
+cv2_net = None
+detector_model_type = None
 
+# --- utilities ---
 def _next_id():
     global _next_track_id
     tid = _next_track_id
     _next_track_id += 1
     return tid
+
+# small numeric helper
+def clamp(x, a, b):
+    """Clamp x to [a, b]. Works with ints/floats."""
+    try:
+        return max(a, min(b, x))
+    except Exception:
+        # if types incompatible, try float conversion
+        try:
+            xf = float(x)
+            return max(a, min(b, xf))
+        except Exception:
+            return a
 
 
 def download_stream(url, dest_path):
@@ -95,27 +181,15 @@ def download_stream(url, dest_path):
         print(f"Downloading {url} ...")
         with requests.get(url, stream=True, timeout=60) as r:
             r.raise_for_status()
-            total = int(r.headers.get("content-length", 0))
             with open(dest, "wb") as f:
-                downloaded = 0
                 for chunk in r.iter_content(chunk_size=8192):
                     if chunk:
                         f.write(chunk)
-                        downloaded += len(chunk)
-                        if total:
-                            pct = downloaded * 100 // total
-                            print(f"\r  {pct}% ({downloaded}/{total} bytes)", end="", flush=True)
-        if total:
-            print("\r  100%")
-        else:
-            print("  Download complete")
+        print("Download done.")
         return True
     except Exception as e:
-        print(f"\nDownload failed for {url}: {e}")
-        if dest.exists():
-            dest.unlink()
+        print("Download error:", e)
         return False
-
 
 def ensure_model_files():
     ok = True
@@ -125,129 +199,33 @@ def ensure_model_files():
         ok = download_stream(CAFFEMODEL_URL, CAFFEMODEL) and ok
     return ok
 
-
 def download_lbf_if_needed():
     if not os.path.exists(LBF_MODEL):
-        print("LBF facemark model not found locally. Attempting to download...")
+        print("Downloading LBF model...")
         return download_stream(LBF_MODEL_URL, LBF_MODEL)
     return True
 
-
-def load_dnn_detector():
-    """
-    Try to load a higher-performance ONNX model (if present) first, otherwise fall back to
-    the original Caffe SSD res10. Returns (net, model_type) where model_type is 'onnx' or 'caffe'.
-    """
-    # Prefer ONNX file if present (user may place a RetinaFace or other ONNX here)
-    if os.path.exists(ONNX_MODEL):
-        try:
-            print(f"Loading ONNX model from {ONNX_MODEL} ...")
-            net = cv2.dnn.readNetFromONNX(ONNX_MODEL)
-            print("Loaded ONNX model.")
-            return net, "onnx"
-        except Exception as e:
-            print("Failed to load ONNX model:", e)
-            # fallthrough to caffe
-    # fall back to Caffe SSD res10
-    try:
-        net = cv2.dnn.readNetFromCaffe(PROTOTXT, CAFFEMODEL)
-        return net, "caffe"
-    except Exception as e:
-        print(f"Failed to load DNN model (Caffe): {e}")
-        return None, None
-
-
-def configure_dnn_backend(net):
-    """
-    Attempt to set the DNN backend/target to use CUDA / TensorRT if available.
-    This is a best-effort step: it will succeed only if the OpenCV build + drivers support it.
-    """
-    try:
-        cuda_count = 0
-        if hasattr(cv2, "cuda"):
-            try:
-                cuda_count = cv2.cuda.getCudaEnabledDeviceCount()
-            except Exception:
-                cuda_count = 0
-        if cuda_count > 0:
-            # prefer FP16 target if available (many builds that support TensorRT expose CUDA_FP16)
-            try:
-                net.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
-                # try FP16 target first (may use TensorRT in some builds)
-                net.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA_FP16)
-                print("DNN backend set to CUDA, target set to CUDA_FP16 (TensorRT path if available).")
-            except Exception as e1:
-                try:
-                    net.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
-                    net.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
-                    print("DNN backend set to CUDA, target set to CUDA.")
-                except Exception as e2:
-                    print("Could not set CUDA backend/target for DNN:", e1, e2)
-                    print("Falling back to CPU backend.")
-        else:
-            print("No CUDA device detected or OpenCV CUDA module unavailable. Using default (CPU) backend.")
-    except Exception as e:
-        print("Error while configuring DNN backend:", e)
-
-
-def load_haar_detector():
-    haar_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-    if os.path.exists(haar_path):
-        cascade = cv2.CascadeClassifier(haar_path)
-        return cascade
-    return None
-
-
 def try_load_facemark():
-    """
-    Try to create facemark LBF if OpenCV has the face module and LBF file is present.
-    Returns facemark object or None. Also sets global use_facemark accordingly.
-    """
     global facemark, use_facemark
     if not hasattr(cv2, "face"):
-        print("cv2.face module not available. Facial landmarks disabled.")
+        print("cv2.face not available; facemark disabled.")
         use_facemark = False
         return None
     try:
-        ok = download_lbf_if_needed()
-        if not ok:
-            print("Failed to download LBF model; facemark disabled.")
+        if not download_lbf_if_needed():
             use_facemark = False
             return None
         facemark_local = cv2.face.createFacemarkLBF()
         facemark_local.loadModel(LBF_MODEL)
         facemark = facemark_local
         use_facemark = True
-        print("Facemark LBF loaded — using facial landmarks for masks.")
-        return facemark
+        print("Facemark LBF loaded.")
     except Exception as e:
-        print(f"Facemark creation failed: {e}")
+        print("Facemark load failed:", e)
         use_facemark = False
-        return None
 
-
-def grab_snapshot_frame(url, timeout=5):
-    """Return BGR frame from a JPEG snapshot URL or None on failure."""
-    try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
-            data = resp.read()
-        arr = np.frombuffer(data, dtype=np.uint8)
-        frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        return frame
-    except Exception:
-        return None
-
-
-# ----------------- MJPEG threaded reader -----------------
+# MJPEG threaded reader
 class MJPEGStream:
-    """
-    Threaded MJPEG stream reader.
-    Usage:
-        s = MJPEGStream("http://192.168.2.164:8080/video?x.mjpg")
-        s.start()
-        frame = s.read()   # returns most recent frame (BGR) or None
-        s.stop()
-    """
     def __init__(self, url, timeout=10, reconnect_delay=1.0):
         self.url = url
         self.timeout = timeout
@@ -257,8 +235,6 @@ class MJPEGStream:
         self._frame = None
         self._lock = threading.Lock()
         self.session = None
-
-        # fps meter
         self._frames_count = 0
         self._fps = 0.0
         self._fps_ts = time.time()
@@ -278,7 +254,6 @@ class MJPEGStream:
                     if resp.status_code != 200:
                         time.sleep(self.reconnect_delay)
                         continue
-
                     bytes_buf = b''
                     for chunk in resp.iter_content(chunk_size=8192):
                         if not self._running:
@@ -295,7 +270,6 @@ class MJPEGStream:
                                 if img is not None:
                                     with self._lock:
                                         self._frame = img
-                                    # fps calc
                                     self._frames_count += 1
                                     now = time.time()
                                     if now - self._fps_ts >= 1.0:
@@ -332,26 +306,17 @@ class MJPEGStream:
     def fps(self):
         return self._fps
 
-
-# ----------------- Kalman helper -----------------
+# Kalman
 def create_kalman_for_bbox(bbox):
-    """
-    Create an OpenCV KalmanFilter for bbox tracking.
-    State: [cx, cy, w, h, vx, vy, vw, vh]^T  (8)
-    Measurement: [cx, cy, w, h]^T (4)
-    """
     kf = cv2.KalmanFilter(8, 4)
-    # Transition matrix
     kf.transitionMatrix = np.eye(8, dtype=np.float32)
     for i in range(4):
         kf.transitionMatrix[i, i+4] = 1.0
-    # Measurement matrix: measure first 4 states
     kf.measurementMatrix = np.zeros((4, 8), dtype=np.float32)
     kf.measurementMatrix[0, 0] = 1.0
     kf.measurementMatrix[1, 1] = 1.0
     kf.measurementMatrix[2, 2] = 1.0
     kf.measurementMatrix[3, 3] = 1.0
-    # Noise covariances
     kf.processNoiseCov = np.eye(8, dtype=np.float32) * KF_PROCESS_NOISE
     kf.measurementNoiseCov = np.eye(4, dtype=np.float32) * KF_MEAS_NOISE
     kf.errorCovPost = np.eye(8, dtype=np.float32) * 1.0
@@ -365,8 +330,7 @@ def create_kalman_for_bbox(bbox):
     kf.statePost = state.copy()
     return kf
 
-
-# ----------------- mask/edge refinement helpers -----------------
+# Mask + edges
 def _auto_canny_thresholds(gray, sigma=0.33):
     v = np.median(gray)
     lower = int(max(0, (1.0 - sigma) * v))
@@ -375,12 +339,7 @@ def _auto_canny_thresholds(gray, sigma=0.33):
         lower = max(0, upper - 1)
     return lower, upper
 
-
 def refine_face_mask(roi_bgr):
-    """
-    Given a face ROI (BGR), return a soft mask (0..255) of the head region
-    and an edge image. Uses bilateral filtering + auto-Canny + morphology + convex hull.
-    """
     h, w = roi_bgr.shape[:2]
     gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
     gray_filtered = cv2.bilateralFilter(gray, BILATERAL_D, BILATERAL_SIGMA_COLOR, BILATERAL_SIGMA_SPACE)
@@ -403,20 +362,14 @@ def refine_face_mask(roi_bgr):
     edge_overlay = cv2.dilate(edges_closed, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3)), iterations=1)
     return mask_blurred, edge_overlay
 
-
 def mask_from_landmarks(landmarks, bbox):
-    """
-    landmarks: Nx2 array (absolute coordinates) OR coordinates relative to bbox.
-    bbox: (x1,y1,x2,y2)
-    returns local_mask (h_roi, w_roi) as uint8 and edge image (same size)
-    """
     x1, y1, x2, y2 = bbox
     w = x2 - x1
     h = y2 - y1
     if w <= 0 or h <= 0:
         return None, None
     pts = np.array(landmarks, dtype=np.int32)
-    if pts.ndim == 3:  # sometimes returned as [[[x,y]], ...]
+    if pts.ndim == 3:
         pts = pts.reshape(-1, 2)
     if np.any(pts[:,0] > w) or np.any(pts[:,1] > h):
         pts = pts - np.array([x1, y1], dtype=np.int32)
@@ -429,7 +382,6 @@ def mask_from_landmarks(landmarks, bbox):
     except Exception:
         cv2.ellipse(mask, (w//2, h//2), (int(w*0.45), int(h*0.55)), 0, 0, 360, 255, -1)
     mask_blurred = cv2.GaussianBlur(mask, MASK_BLUR_KERNEL, 0)
-    # edge image from polygon boundary
     edges = np.zeros_like(mask)
     try:
         cv2.polylines(edges, [hull], True, 255, 1)
@@ -438,10 +390,8 @@ def mask_from_landmarks(landmarks, bbox):
     edges = cv2.dilate(edges, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3)), iterations=1)
     return mask_blurred, edges
 
-
-# ----------------- tracking helpers -----------------
+# Tracking helpers
 def iou(boxA, boxB):
-    # boxes: (x1,y1,x2,y2)
     xA = max(boxA[0], boxB[0])
     yA = max(boxA[1], boxB[1])
     xB = min(boxA[2], boxB[2])
@@ -456,12 +406,7 @@ def iou(boxA, boxB):
         return 0.0
     return interArea / union
 
-
 def match_detections_to_tracks(detections, current_tracks):
-    """
-    Match detections to existing tracks using predicted bbox if available (track['bbox_pred']),
-    otherwise use bbox_smoothed. Returns mapping list of track ids or None.
-    """
     mapping = [None] * len(detections)
     if not current_tracks:
         return mapping
@@ -484,7 +429,6 @@ def match_detections_to_tracks(detections, current_tracks):
             used_tracks.add(best_tid)
     return mapping
 
-
 def create_fullframe_mask(frame_h, frame_w, bbox, local_mask):
     x1, y1, x2, y2 = bbox
     fh, fw = frame_h, frame_w
@@ -502,312 +446,685 @@ def create_fullframe_mask(frame_h, frame_w, bbox, local_mask):
     full[y1c:y2c, x1c:x2c] = resized
     return full
 
-
 def update_or_create_track(track_id, det, frame_h, frame_w):
     """
-    If track_id is None -> create new track with Kalman filter.
-    Else update smoothed bbox and correct Kalman with measurement.
+    If track_id is None -> create new track for det and return new id.
+    Otherwise update existing track (smooth bbox, append masks/edges, update KF/confidence).
+    det must contain keys: 'box' (x1,y1,x2,y2), 'mask_local', 'edges_local', optionally 'confidence' and 'pose'.
     """
+    global tracks
+    # Ensure det contains mask_local/edges_local
+    bbox = det.get('box')
+    if bbox is None:
+        return None
+
+    # New track
     if track_id is None:
         tid = _next_id()
-        bbox = det['box']
+        x1, y1, x2, y2 = bbox
         track = {
-            'bbox_smoothed': bbox,
+            'bbox_smoothed': (int(x1), int(y1), int(x2), int(y2)),
             'masks': deque(maxlen=MASK_HISTORY),
             'edges': deque(maxlen=MASK_HISTORY),
             'last_seen': 0,
-            'confidence': det.get('confidence', 1.0),
+            'confidence': float(det.get('confidence', 1.0)),
+            'conf_smoothed': float(det.get('confidence', 1.0)),
+            'mask_enabled': False,
+            'mask_hold': 0,
+            'pose': det.get('pose', (0.0, 0.0, 0.0)),
         }
-        # create Kalman and store
+        # create kalman filter for this bbox if helper exists
         try:
-            kf = create_kalman_for_bbox(bbox)
-            track['kf'] = kf
+            track['kf'] = create_kalman_for_bbox((int(x1), int(y1), int(x2), int(y2)))
         except Exception:
             track['kf'] = None
 
-        mask_full = create_fullframe_mask(frame_h, frame_w, bbox, det['mask_local'])
-        edges_full = create_fullframe_mask(frame_h, frame_w, bbox, det['edges_local'])
+        # create full-frame masks and edges and append
+        mask_local = det.get('mask_local')
+        edges_local = det.get('edges_local')
+        if mask_local is None:
+            # fallback to a small filled ellipse in bbox
+            w = max(1, int(x2 - x1)); h = max(1, int(y2 - y1))
+            mask_local = np.zeros((h, w), dtype=np.uint8)
+            cv2.ellipse(mask_local, (w//2, h//2), (int(w*0.45), int(h*0.55)), 0, 0, 360, 255, -1)
+        if edges_local is None:
+            edges_local = np.zeros_like(mask_local)
+
+        mask_full = create_fullframe_mask(frame_h, frame_w, (int(x1), int(y1), int(x2), int(y2)), mask_local)
+        edges_full = create_fullframe_mask(frame_h, frame_w, (int(x1), int(y1), int(x2), int(y2)), edges_local)
         track['masks'].append(mask_full)
         track['edges'].append(edges_full)
+
         tracks[tid] = track
         return tid
-    else:
-        tr = tracks[track_id]
-        x1, y1, x2, y2 = det['box']
-        bx1, by1, bx2, by2 = tr['bbox_smoothed']
-        nbx1 = int(BBOX_EMA_ALPHA * bx1 + (1.0 - BBOX_EMA_ALPHA) * x1)
-        nby1 = int(BBOX_EMA_ALPHA * by1 + (1.0 - BBOX_EMA_ALPHA) * y1)
-        nbx2 = int(BBOX_EMA_ALPHA * bx2 + (1.0 - BBOX_EMA_ALPHA) * x2)
-        nby2 = int(BBOX_EMA_ALPHA * by2 + (1.0 - BBOX_EMA_ALPHA) * y2)
-        tr['bbox_smoothed'] = (nbx1, nby1, nbx2, nby2)
-        mask_full = create_fullframe_mask(frame_h, frame_w, tr['bbox_smoothed'], det['mask_local'])
-        edges_full = create_fullframe_mask(frame_h, frame_w, tr['bbox_smoothed'], det['edges_local'])
-        tr['masks'].append(mask_full)
-        tr['edges'].append(edges_full)
-        tr['last_seen'] = 0
-        tr['confidence'] = det.get('confidence', tr.get('confidence', 1.0))
 
-        # correct the Kalman filter with measurement (cx,cy,w,h)
-        if 'kf' in tr and tr['kf'] is not None:
+    # Update existing track
+    tr = tracks.get(track_id)
+    if tr is None:
+        # if track disappeared, create new instead
+        return update_or_create_track(None, det, frame_h, frame_w)
+
+    x1, y1, x2, y2 = bbox
+    bx1, by1, bx2, by2 = tr.get('bbox_smoothed', (x1, y1, x2, y2))
+
+    # Exponential moving average (EMA) smoothing of bbox
+    nbx1 = int(BBOX_EMA_ALPHA * bx1 + (1.0 - BBOX_EMA_ALPHA) * x1)
+    nby1 = int(BBOX_EMA_ALPHA * by1 + (1.0 - BBOX_EMA_ALPHA) * y1)
+    nbx2 = int(BBOX_EMA_ALPHA * bx2 + (1.0 - BBOX_EMA_ALPHA) * x2)
+    nby2 = int(BBOX_EMA_ALPHA * by2 + (1.0 - BBOX_EMA_ALPHA) * y2)
+    tr['bbox_smoothed'] = (nbx1, nby1, nbx2, nby2)
+
+    # Append masks/edges (convert to full-frame)
+    mask_local = det.get('mask_local')
+    edges_local = det.get('edges_local')
+    if mask_local is None:
+        w = max(1, int(x2 - x1)); h = max(1, int(y2 - y1))
+        mask_local = np.zeros((h, w), dtype=np.uint8)
+        cv2.ellipse(mask_local, (w//2, h//2), (int(w*0.45), int(h*0.55)), 0, 0, 360, 255, -1)
+    if edges_local is None:
+        edges_local = np.zeros_like(mask_local)
+
+    mask_full = create_fullframe_mask(frame_h, frame_w, tr['bbox_smoothed'], mask_local)
+    edges_full = create_fullframe_mask(frame_h, frame_w, tr['bbox_smoothed'], edges_local)
+    tr['masks'].append(mask_full)
+    tr['edges'].append(edges_full)
+
+    # Update last seen and confidence measurement
+    tr['last_seen'] = 0
+    tr['confidence'] = float(det.get('confidence', tr.get('confidence', 1.0)))
+
+    # Confidence smoothing (EMA)
+    prev_sm = float(tr.get('conf_smoothed', tr['confidence']))
+    tr['conf_smoothed'] = CONF_ALPHA * prev_sm + (1.0 - CONF_ALPHA) * tr['confidence']
+
+    # Hysteresis for enabling/disabling mask rendering
+    if not tr.get('mask_enabled', False) and tr['conf_smoothed'] > MASK_ENABLE_THRESH:
+        tr['mask_enabled'] = True
+        tr['mask_hold'] = 0
+    if tr.get('mask_enabled', False):
+        if tr['conf_smoothed'] < MASK_DISABLE_THRESH:
+            tr['mask_hold'] = tr.get('mask_hold', 0) + 1
+            if tr['mask_hold'] > MASK_DISABLE_HOLD:
+                tr['mask_enabled'] = False
+                tr['mask_hold'] = 0
+        else:
+            tr['mask_hold'] = 0
+
+    # Kalman filter correction with measurement (cx,cy,w,h)
+    if 'kf' in tr and tr['kf'] is not None:
+        try:
             cx = float((x1 + x2) / 2.0)
             cy = float((y1 + y2) / 2.0)
             w = float(max(1.0, x2 - x1))
             h = float(max(1.0, y2 - y1))
-            meas = np.array([cx, cy, w, h], dtype=np.float32).reshape(4, 1)
-            try:
-                tr['kf'].correct(meas)
-            except Exception:
-                pass
+            meas = np.array([cx, cy, w, h], dtype=np.float32).reshape(4,1)
+            tr['kf'].correct(meas)
+        except Exception:
+            pass
 
-        return track_id
+    # update pose if provided
+    if 'pose' in det:
+        tr['pose'] = det.get('pose', tr.get('pose', (0.0, 0.0, 0.0)))
 
-
-def garbage_collect_tracks():
-    to_delete = []
-    for tid, tr in list(tracks.items()):
-        tr['last_seen'] += 1
-        if tr['last_seen'] > TRACK_DROP_FRAMES:
-            to_delete.append(tid)
-    for tid in to_delete:
-        del tracks[tid]
+    return track_id
 
 
-# ----------------- main processing -----------------
+# ----------------- Sparse-LK warp helper (new) -----------------
+def sparse_lk_warp_prev_mask_to_current(prev_mask_full, prev_gray, cur_gray, bbox):
+    """
+    Warp prev_mask (full-frame) to current frame for the given bbox using sparse LK + affine fit.
+    Returns a full-frame warped mask (uint8) the same size as prev_mask_full.
+    If warp fails, returns None.
+    """
+    try:
+        h_full, w_full = prev_mask_full.shape[:2]
+        x1, y1, x2, y2 = bbox
+        if x2 <= x1 or y2 <= y1:
+            return None
+        # crop roi
+        sx, sy, ex, ey = x1, y1, x2, y2
+        sx = max(0, sx); sy = max(0, sy); ex = min(w_full, ex); ey = min(h_full, ey)
+        roi_mask = prev_mask_full[sy:ey, sx:ex]
+        if roi_mask.size == 0:
+            return None
+        roi_h, roi_w = roi_mask.shape[:2]
+        # build mask for goodFeaturesToTrack (points only inside mask)
+        mask = (roi_mask > 10).astype(np.uint8) * 255
+        # if mask area tiny, expand to whole roi
+        if cv2.countNonZero(mask) < 10:
+            mask = None
+        # select points within ROI (coords relative to ROI)
+        prev_gray_roi = prev_gray[sy:ey, sx:ex]
+        # cv2.goodFeaturesToTrack expects 8-bit single-channel
+        try:
+            corners = cv2.goodFeaturesToTrack(prev_gray_roi,
+                                              maxCorners=SPARSE_LK_MAX_CORNERS,
+                                              qualityLevel=SPARSE_LK_QUALITY,
+                                              minDistance=SPARSE_LK_MIN_DIST,
+                                              mask=mask)
+        except Exception:
+            corners = None
+        if corners is None or len(corners) < 6:
+            return None
+        pts_prev = corners.reshape(-1,2)
+        # convert to full-frame coords for LK
+        pts_prev_full = pts_prev + np.array([sx, sy], dtype=np.float32)
+
+        # calc LK to find new pts in current gray
+        pts_prev_full = pts_prev_full.astype(np.float32)
+        pts_next, st, err = cv2.calcOpticalFlowPyrLK(prev_gray, cur_gray, pts_prev_full, None,
+                                                     winSize=SPARSE_LK_WIN_SIZE,
+                                                     maxLevel=SPARSE_LK_MAX_LEVEL,
+                                                     criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01))
+        if pts_next is None:
+            return None
+        st = st.reshape(-1)
+        good_prev = pts_prev_full[st==1]
+        good_next = pts_next[st==1]
+        if len(good_prev) < 6 or len(good_next) < 6:
+            return None
+        # compute affine transform from good_prev to good_next (full-frame coords)
+        M, inliers = cv2.estimateAffinePartial2D(good_prev, good_next, method=cv2.RANSAC, ransacReprojThreshold=4.0, maxIters=100)
+        if M is None:
+            return None
+        # warp ROI mask with affine: need ROI-local transform -> adjust translation
+        # create a 2x3 matrix that maps ROI coords to new ROI coords.
+        # current M maps full-frame coordinates: x' = M * [x; y; 1]
+        # for ROI-local warp, we compute M_local that maps (x - sx, y - sy) -> (x' - sx, y' - sy)
+        # i.e., M_local = T(-[sx,sy]) * M * T([sx,sy])
+        T1 = np.array([[1,0,-sx],[0,1,-sy],[0,0,1]], dtype=np.float32)
+        T2 = np.array([[1,0,sx],[0,1,sy],[0,0,1]], dtype=np.float32)
+        M3 = np.eye(3, dtype=np.float32)
+        M_aff = np.vstack([M, [0,0,1]]).astype(np.float32)
+        M_local = (T1 @ M_aff @ T2)
+        M_local2x3 = M_local[:2, :]
+        # warp roi_mask
+        warped_roi = cv2.warpAffine(roi_mask, M_local2x3, (roi_w, roi_h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        # paste into full-frame mask
+        full = np.zeros((h_full, w_full), dtype=np.uint8)
+        full[sy:ey, sx:ex] = warped_roi
+        # slight blur to smooth
+        full = cv2.GaussianBlur(full, (9,9), 0)
+        return full
+    except Exception:
+        return None
+
+# Dense Farneback warp (kept as fallback)
+def _warp_mask_by_flow(prev_mask, flow):
+    h, w = prev_mask.shape[:2]
+    grid_x, grid_y = np.meshgrid(np.arange(w), np.arange(h))
+    map_x = (grid_x - flow[..., 0]).astype(np.float32)
+    map_y = (grid_y - flow[..., 1]).astype(np.float32)
+    warped = cv2.remap(prev_mask, map_x, map_y, interpolation=cv2.INTER_LINEAR,
+                       borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    return warped
+
+# Sepia and HUD helpers
+SEPIA_KERNEL_BGR = np.array([
+    [0.131, 0.534, 0.272],
+    [0.168, 0.686, 0.349],
+    [0.189, 0.769, 0.393],
+], dtype=np.float32)
 def apply_sepia_to_frame(frame):
-    """
-    Apply sepia tint to a BGR frame using SEPIA_KERNEL_BGR via cv2.transform.
-    Returns uint8 BGR image clipped to [0,255].
-    """
     transformed = cv2.transform(frame.astype(np.float32), SEPIA_KERNEL_BGR)
     transformed = np.clip(transformed, 0, 255).astype(np.uint8)
     return transformed
 
+def draw_hud(img, stream_fps, proc_fps, infer_ms, num_tracks):
+    txts = [
+        f"stream_fps: {stream_fps:.1f}",
+        f"proc_fps: {proc_fps:.1f}",
+        f"infer: {infer_ms:.1f} ms",
+        f"tracks: {num_tracks}"
+    ]
+    x = 8
+    y = 20
+    for t in txts:
+        cv2.putText(img, t, (x,y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255,255,255), 1, cv2.LINE_AA)
+        y += 18
 
-def process_and_draw(frame, net, cascade, use_haar, frozen_flag=False, log_writer=None, log_file=None, frame_idx=None):
+# ONNX helpers
+def init_onnx_runtime(onnx_path):
+    if ort is None:
+        return None
+    if not os.path.exists(onnx_path):
+        return None
+    try:
+        providers = ort.get_available_providers()
+        if "CUDAExecutionProvider" in providers:
+            sess = ort.InferenceSession(onnx_path, providers=["CUDAExecutionProvider","CPUExecutionProvider"])
+        else:
+            sess = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
+        return sess
+    except Exception as e:
+        print("ONNX init failed:", e)
+        return None
+
+def load_detector_with_onnx_fallback():
+    onnx_sess = None
+    cv2_net_local = None
+    model_type_local = None
+    if ort is not None and os.path.exists(ONNX_MODEL):
+        onnx_sess = init_onnx_runtime(ONNX_MODEL)
+        if onnx_sess is not None:
+            return onnx_sess, None, "onnx_runtime"
+    if os.path.exists(PROTOTXT) and os.path.exists(CAFFEMODEL):
+        try:
+            cv2_net_local = cv2.dnn.readNetFromCaffe(PROTOTXT, CAFFEMODEL)
+            model_type_local = "caffe"
+            return None, cv2_net_local, model_type_local
+        except Exception as e:
+            print("Caffe load failed:", e)
+    return None, None, None
+
+def run_onnx_inference(sess, frame, target_input_shape=(300,300), mean=(104.0, 177.0, 123.0)):
+    if sess is None:
+        return None
+    input_meta = sess.get_inputs()[0]
+    in_shape = input_meta.shape
+    ih, iw = target_input_shape
+    use_nchw = True
+    try:
+        if len(in_shape) == 4:
+            if in_shape[1] == 3 or in_shape[1] == '3':
+                use_nchw = True
+                ih = in_shape[2] if isinstance(in_shape[2], int) and in_shape[2] > 0 else ih
+                iw = in_shape[3] if isinstance(in_shape[3], int) and in_shape[3] > 0 else iw
+            elif in_shape[3] == 3 or in_shape[3] == '3':
+                use_nchw = False
+                ih = in_shape[1] if isinstance(in_shape[1], int) and in_shape[1] > 0 else ih
+                iw = in_shape[2] if isinstance(in_shape[2], int) and in_shape[2] > 0 else iw
+    except Exception:
+        pass
+    img = cv2.resize(frame, (int(iw), int(ih))).astype(np.float32)
+    img = img - np.array(mean, dtype=np.float32)
+    if use_nchw:
+        inp = img.transpose(2,0,1)[None, :, :, :].astype(np.float32)
+    else:
+        inp = img[None, :, :, :].astype(np.float32)
+    input_name = sess.get_inputs()[0].name
+    try:
+        outputs = sess.run(None, {input_name: inp})
+        return outputs
+    except Exception as e:
+        print("ONNX infer failed:", e)
+        return None
+
+def parse_onnx_outputs(outputs, frame_w, frame_h):
+    dets = []
+    if outputs is None:
+        return dets
+    for out in outputs:
+        if isinstance(out, np.ndarray) and out.ndim == 4 and out.shape[1] == 1 and out.shape[3] >= 7:
+            arr = out
+            for i in range(arr.shape[2]):
+                confidence = float(arr[0,0,i,2])
+                if confidence < CONF_THRESHOLD:
+                    continue
+                box = arr[0,0,i,3:7] * np.array([frame_w, frame_h, frame_w, frame_h])
+                sx, sy, ex, ey = box.astype(int)
+                dets.append({'box':(int(sx),int(sy),int(ex),int(ey)), 'confidence':confidence})
+            if dets:
+                return dets
+    for out in outputs:
+        if isinstance(out, np.ndarray) and out.ndim == 2 and out.shape[1] >= 5:
+            arr = out
+            for row in arr:
+                score = float(row[4])
+                if score < CONF_THRESHOLD:
+                    continue
+                x1 = row[0]; y1 = row[1]; x2 = row[2]; y2 = row[3]
+                if 0.0 <= x1 <= 1.0 and 0.0 <= x2 <= 1.0 and 0.0 <= y1 <= 1.0 and 0.0 <= y2 <= 1.0:
+                    sx = int(x1 * frame_w)
+                    sy = int(y1 * frame_h)
+                    ex = int(x2 * frame_w)
+                    ey = int(y2 * frame_h)
+                else:
+                    sx = int(x1); sy = int(y1); ex = int(x2); ey = int(y2)
+                dets.append({'box':(sx, sy, ex, ey), 'confidence':score})
+            if dets:
+                return dets
+    boxes = None; scores = None
+    for out in outputs:
+        if isinstance(out, np.ndarray):
+            if out.ndim == 2 and out.shape[1] == 4 and boxes is None:
+                boxes = out
+            elif out.ndim == 1 and scores is None:
+                scores = out
+            elif out.ndim == 2 and out.shape[1] == 1 and scores is None:
+                scores = out.reshape(-1)
+    if boxes is not None and scores is not None:
+        N = min(boxes.shape[0], scores.shape[0])
+        for i in range(N):
+            score = float(scores[i])
+            if score < CONF_THRESHOLD:
+                continue
+            x1, y1, x2, y2 = boxes[i]
+            if 0.0 <= x1 <= 1.0 and 0.0 <= x2 <= 1.0 and 0.0 <= y1 <= 1.0 and 0.0 <= y2 <= 1.0:
+                sx = int(x1 * frame_w)
+                sy = int(y1 * frame_h)
+                ex = int(x2 * frame_w)
+                ey = int(y2 * frame_h)
+            else:
+                sx = int(x1); sy = int(y1); ex = int(x2); ey = int(y2)
+            dets.append({'box':(sx, sy, ex, ey), 'confidence':score})
+        if dets:
+            return dets
+    return dets
+
+# Pose helpers
+def rotationMatrixToEulerAngles(R):
+    sy = math.sqrt(R[0,0]*R[0,0] + R[1,0]*R[1,0])
+    singular = sy < 1e-6
+    if not singular:
+        x = math.atan2(R[2,1], R[2,2])
+        y = math.atan2(-R[2,0], sy)
+        z = math.atan2(R[1,0], R[0,0])
+    else:
+        x = math.atan2(-R[1,2], R[1,1])
+        y = math.atan2(-R[2,0], sy)
+        z = 0
+    return (math.degrees(y), math.degrees(x), math.degrees(z))
+
+def estimate_head_pose_from_landmarks(landmarks, frame_shape, camera_matrix=None, dist_coeffs=None):
+    try:
+        pts = np.asarray(landmarks).reshape(-1, 2)
+        idx = LANDMARK_IDX
+        image_points = np.array([
+            pts[idx['nose_tip']],
+            pts[idx['chin']],
+            pts[idx['left_eye_outer']],
+            pts[idx['right_eye_outer']],
+            pts[idx['mouth_left']],
+            pts[idx['mouth_right']],
+        ], dtype=np.float32)
+        h, w = frame_shape[:2]
+        if camera_matrix is None:
+            focal_length = w
+            center = (w / 2.0, h / 2.0)
+            camera_matrix = np.array([[focal_length, 0, center[0]],
+                                       [0, focal_length, center[1]],
+                                       [0, 0, 1]], dtype=np.float32)
+        if dist_coeffs is None:
+            dist_coeffs = np.zeros((4,1), dtype=np.float32)
+        retval, rvec, tvec = cv2.solvePnP(FACE_3D_MODEL, image_points, camera_matrix, dist_coeffs, flags=cv2.SOLVEPNP_ITERATIVE)
+        if not retval:
+            return (0.0, 0.0, 0.0)
+        R, _ = cv2.Rodrigues(rvec)
+        yaw_deg, pitch_deg, roll_deg = rotationMatrixToEulerAngles(R)
+        return (yaw_deg, pitch_deg, roll_deg)
+    except Exception:
+        return (0.0, 0.0, 0.0)
+
+def garbage_collect_tracks():
     """
-    Detect faces this frame, create local masks, match to tracks, update tracks,
-    then apply averaged masks from tracks to the frame to produce sepia-tinted faces.
-    Also logs track positions to CSV if log_writer provided.
-    Uses per-track Kalman filter predictions for matching.
+    Increment last_seen for all tracks, apply light confidence decay and
+    mask-disable logic, then remove tracks that have been missing for
+    more than TRACK_DROP_FRAMES frames.
     """
+    to_delete = []
+    for tid, tr in list(tracks.items()):
+        # ensure last_seen present
+        tr['last_seen'] = tr.get('last_seen', 0) + 1
+
+        # gentle confidence decay so long-lived tracks slowly drop if not updated
+        if 'conf_smoothed' in tr:
+            # decay factor (slightly <1)
+            tr['conf_smoothed'] = float(tr['conf_smoothed']) * 0.98
+
+            # if mask was enabled but confidence dropped well below threshold, disable it
+            if tr.get('mask_enabled', False) and tr['conf_smoothed'] < (MASK_DISABLE_THRESH * 0.8):
+                tr['mask_enabled'] = False
+                tr['mask_hold'] = 0
+
+        # if a track hasn't been seen for too many frames, mark for deletion
+        if tr['last_seen'] > TRACK_DROP_FRAMES:
+            to_delete.append(tid)
+
+    # remove stale tracks
+    for tid in to_delete:
+        try:
+            # free any heavy structures (Kalman filter) if present
+            if tid in tracks and 'kf' in tracks[tid]:
+                try:
+                    # no explicit close for cv2.KalmanFilter but drop ref
+                    tracks[tid]['kf'] = None
+                except Exception:
+                    pass
+            del tracks[tid]
+        except KeyError:
+            pass
+
+
+# Main processing (modified to use sparse-LK when appropriate and draw overlay)
+def process_and_draw(frame, frozen_flag=False, log_writer=None, log_file=None, frame_idx=None, cam_matrix=None, dist_coeffs=None):
+    global _prev_gray, _stream_fps, _proc_fps, _avg_infer_ms
     frame_h, frame_w = frame.shape[:2]
     detections = []
 
-    # ---------- predict step for all existing tracks ----------
+    start_t = time.time()
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    use_sparse_lk = (frame_w * frame_h) >= SPARSE_LK_FRAME_AREA_THRESH
+
+    # If sparse-LK: per-track sparse warp, else dense flow for all tracks
+    if use_sparse_lk and _prev_gray is not None and _prev_gray.shape == gray.shape:
+        # per-track sparse LK warp
+        for tid, tr in list(tracks.items()):
+            if len(tr['masks']) == 0:
+                continue
+            try:
+                prev_mask = tr['masks'][-1]
+                warped_full = sparse_lk_warp_prev_mask_to_current(prev_mask, _prev_gray, gray, tr.get('bbox_smoothed', (0,0,0,0)))
+                if warped_full is not None:
+                    tr['masks'].append(warped_full)
+                else:
+                    # fallback: keep previous mask (no warp) to avoid sudden disappearance
+                    tr['masks'].append(prev_mask.copy())
+                if len(tr['edges'])>0:
+                    prev_edges = tr['edges'][-1]
+                    warped_edges = sparse_lk_warp_prev_mask_to_current(prev_edges, _prev_gray, gray, tr.get('bbox_smoothed', (0,0,0,0)))
+                    if warped_edges is not None:
+                        tr['edges'].append(warped_edges)
+                    else:
+                        tr['edges'].append(prev_edges.copy())
+            except Exception:
+                pass
+    else:
+        # dense flow path
+        flow = None
+        if _prev_gray is not None and _prev_gray.shape == gray.shape:
+            try:
+                flow = cv2.calcOpticalFlowFarneback(_prev_gray, gray, None,
+                                                    pyr_scale=FLOW_PYRAMID_SCALE,
+                                                    levels=FLOW_LEVELS,
+                                                    winsize=FLOW_WINSIZE,
+                                                    iterations=FLOW_ITER,
+                                                    poly_n=FLOW_POLY_N,
+                                                    poly_sigma=FLOW_POLY_SIGMA,
+                                                    flags=FLOW_FLAGS)
+            except Exception:
+                flow = None
+        if flow is not None:
+            for tid, tr in list(tracks.items()):
+                try:
+                    if len(tr['masks']) > 0:
+                        prev_mask = tr['masks'][-1]
+                        warped_mask = _warp_mask_by_flow(prev_mask, flow)
+                        tr['masks'].append(warped_mask)
+                    if len(tr['edges']) > 0:
+                        prev_edges = tr['edges'][-1]
+                        warped_edges = _warp_mask_by_flow(prev_edges, flow)
+                        tr['edges'].append(warped_edges)
+                except Exception:
+                    pass
+
+    # Kalman predict
     for tid, tr in list(tracks.items()):
         if 'kf' in tr and tr['kf'] is not None:
             try:
-                pred = tr['kf'].predict()  # (8,1)
-                pcx = float(pred[0, 0])
-                pcy = float(pred[1, 0])
-                pw = float(max(1.0, pred[2, 0]))
-                ph = float(max(1.0, pred[3, 0]))
-                px1 = int(pcx - pw / 2.0)
-                py1 = int(pcy - ph / 2.0)
-                px2 = int(pcx + pw / 2.0)
-                py2 = int(pcy + ph / 2.0)
-                # clip to frame
-                px1 = max(0, min(frame_w - 1, px1))
-                py1 = max(0, min(frame_h - 1, py1))
-                px2 = max(0, min(frame_w - 1, px2))
-                py2 = max(0, min(frame_h - 1, py2))
+                pred = tr['kf'].predict()
+                pcx = float(pred[0,0]); pcy = float(pred[1,0])
+                pw = float(max(1.0, pred[2,0])); ph = float(max(1.0, pred[3,0]))
+                px1 = int(pcx - pw/2.0); py1 = int(pcy - ph/2.0)
+                px2 = int(pcx + pw/2.0); py2 = int(pcy + ph/2.0)
+                px1 = max(0, min(frame_w-1, px1)); py1 = max(0, min(frame_h-1, py1))
+                px2 = max(0, min(frame_w-1, px2)); py2 = max(0, min(frame_h-1, py2))
                 tr['bbox_pred'] = (px1, py1, px2, py2)
             except Exception:
                 tr['bbox_pred'] = tr.get('bbox_smoothed')
-        else:
-            tr['bbox_pred'] = tr.get('bbox_smoothed')
 
+    infer_ms = 0.0
+    # detection
     if not frozen_flag:
-        if not use_haar and net is not None:
-            # standard DNN forward
-            blob = cv2.dnn.blobFromImage(cv2.resize(frame, (300, 300)),
-                                         1.0, (300, 300),
-                                         (104.0, 177.0, 123.0), swapRB=False, crop=False)
-            net.setInput(blob)
-            try:
-                dets = net.forward()
-            except Exception as e:
-                # If ONNX retinaface or other model has different output layout,
-                # it's possible the model needs custom postprocessing; fallback gracefully.
-                print(f"DNN forward error: {e}")
-                dets = None
-            if dets is not None:
-                # handle classic SSD output layout (if used)
-                if dets.ndim == 4 and dets.shape[1] == 1 and dets.shape[2] > 0:
-                    for i in range(0, dets.shape[2]):
-                        confidence = float(dets[0, 0, i, 2])
-                        if confidence < CONF_THRESHOLD:
-                            continue
-                        box = dets[0, 0, i, 3:7] * np.array([frame_w, frame_h, frame_w, frame_h])
-                        sx, sy, ex, ey = box.astype("int")
-                        bw = ex - sx
-                        bh = ey - sy
-                        mx = int(bw * FACE_MARGIN)
-                        my = int(bh * FACE_MARGIN)
-                        startX = max(0, sx - mx)
-                        startY = max(0, sy - my)
-                        endX = min(frame_w - 1, ex + mx)
-                        endY = min(frame_h - 1, ey + my)
-                        if endX - startX < 10 or endY - startY < 10:
-                            continue
-                        roi = frame[startY:endY, startX:endX].copy()
-
-                        # try landmarks first (if available)
-                        if use_facemark and facemark is not None:
-                            try:
-                                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                                rect = np.array([[startX, startY, endX - startX, endY - startY]], dtype=np.int32)
-                                ok, shapes = facemark.fit(gray, rect)
-                                if ok and shapes and len(shapes) > 0:
-                                    lm = shapes[0].reshape(-1, 2)
-                                    mask_local, edges_local = mask_from_landmarks(lm, (startX, startY, endX, endY))
-                                    if mask_local is None:
-                                        mask_local, edges_local = refine_face_mask(roi)
-                                else:
-                                    mask_local, edges_local = refine_face_mask(roi)
-                            except Exception:
-                                mask_local, edges_local = refine_face_mask(roi)
-                        else:
-                            mask_local, edges_local = refine_face_mask(roi)
-
-                        detections.append({
-                            'box': (startX, startY, endX, endY),
-                            'confidence': confidence,
-                            'mask_local': mask_local,
-                            'edges_local': edges_local
-                        })
-                else:
-                    # If the ONNX model returns a different layout (e.g., RetinaFace), try a common parsing:
-                    # RetinaFace-like: detections may be Nx6 (x1,y1,x2,y2,score,...) or similar.
-                    # Try to interpret rows as [x1,y1,x2,y2,score,...] if dims match.
-                    if dets.ndim == 2 and dets.shape[1] >= 5:
-                        for row in dets:
-                            score = float(row[4])
-                            if score < CONF_THRESHOLD:
-                                continue
-                            sx = int(row[0] * frame_w) if row[0] <= 1.0 else int(row[0])
-                            sy = int(row[1] * frame_h) if row[1] <= 1.0 else int(row[1])
-                            ex = int(row[2] * frame_w) if row[2] <= 1.0 else int(row[2])
-                            ey = int(row[3] * frame_h) if row[3] <= 1.0 else int(row[3])
-                            bw = ex - sx
-                            bh = ey - sy
-                            mx = int(bw * FACE_MARGIN)
-                            my = int(bh * FACE_MARGIN)
-                            startX = max(0, sx - mx)
-                            startY = max(0, sy - my)
-                            endX = min(frame_w - 1, ex + mx)
-                            endY = min(frame_h - 1, ey + my)
-                            if endX - startX < 10 or endY - startY < 10:
-                                continue
-                            roi = frame[startY:endY, startX:endX].copy()
-                            if use_facemark and facemark is not None:
-                                try:
-                                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                                    rect = np.array([[startX, startY, endX - startX, endY - startY]], dtype=np.int32)
-                                    ok, shapes = facemark.fit(gray, rect)
-                                    if ok and shapes and len(shapes) > 0:
-                                        lm = shapes[0].reshape(-1, 2)
-                                        mask_local, edges_local = mask_from_landmarks(lm, (startX, startY, endX, endY))
-                                        if mask_local is None:
-                                            mask_local, edges_local = refine_face_mask(roi)
-                                    else:
-                                        mask_local, edges_local = refine_face_mask(roi)
-                                except Exception:
-                                    mask_local, edges_local = refine_face_mask(roi)
-                            else:
-                                mask_local, edges_local = refine_face_mask(roi)
-                            detections.append({
-                                'box': (startX, startY, endX, endY),
-                                'confidence': score,
-                                'mask_local': mask_local,
-                                'edges_local': edges_local
-                            })
-                    else:
-                        # unknown output shape — skip detection this frame
-                        pass
-
-        else:
-            # Haar fallback
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5,
-                                             minSize=(30, 30), flags=cv2.CASCADE_SCALE_IMAGE)
-            for (x, y, fw, fh) in faces:
-                mx = int(fw * FACE_MARGIN)
-                my = int(fh * FACE_MARGIN)
-                sx = max(0, x - mx)
-                sy = max(0, y - my)
-                ex = min(frame_w - 1, x + fw + mx)
-                ey = min(frame_h - 1, y + fh + my)
-                if ex - sx < 10 or ey - sy < 10:
+        if detector_model_type == "onnx_runtime" and onnx_session is not None:
+            t0 = time.time()
+            outputs = run_onnx_inference(onnx_session, frame, target_input_shape=(300,300))
+            infer_ms = (time.time() - t0) * 1000.0
+            parsed = parse_onnx_outputs(outputs, frame_w, frame_h)
+            for pd in parsed:
+                sx, sy, ex, ey = pd['box']
+                bw = ex - sx; bh = ey - sy
+                mx = int(bw * FACE_MARGIN); my = int(bh * FACE_MARGIN)
+                startX = max(0, sx - mx); startY = max(0, sy - my)
+                endX = min(frame_w - 1, ex + mx); endY = min(frame_h - 1, ey + my)
+                if endX - startX < 10 or endY - startY < 10:
                     continue
-                roi = frame[sy:ey, sx:ex].copy()
+                roi = frame[startY:endY, startX:endX].copy()
+                pose_yaw = pose_pitch = pose_roll = 0.0
                 if use_facemark and facemark is not None:
                     try:
-                        gray_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                        rect = np.array([[sx, sy, ex - sx, ey - sy]], dtype=np.int32)
-                        ok, shapes = facemark.fit(gray_full, rect)
-                        if ok and shapes and len(shapes) > 0:
-                            lm = shapes[0].reshape(-1, 2)
-                            mask_local, edges_local = mask_from_landmarks(lm, (sx, sy, ex, ey))
+                        rect = np.array([[startX, startY, endX - startX, endY - startY]], dtype=np.int32)
+                        ok, shapes = facemark.fit(gray, rect)
+                        if ok and shapes and len(shapes)>0:
+                            lm = shapes[0].reshape(-1,2)
+                            mask_local, edges_local = mask_from_landmarks(lm, (startX,startY,endX,endY))
                             if mask_local is None:
                                 mask_local, edges_local = refine_face_mask(roi)
+                            pose_yaw, pose_pitch, pose_roll = estimate_head_pose_from_landmarks(lm, frame.shape, camera_matrix=cam_matrix, dist_coeffs=dist_coeffs)
                         else:
                             mask_local, edges_local = refine_face_mask(roi)
                     except Exception:
                         mask_local, edges_local = refine_face_mask(roi)
                 else:
                     mask_local, edges_local = refine_face_mask(roi)
-
                 detections.append({
-                    'box': (sx, sy, ex, ey),
-                    'confidence': 1.0,
+                    'box': (startX, startY, endX, endY),
+                    'confidence': pd.get('confidence', 1.0),
                     'mask_local': mask_local,
-                    'edges_local': edges_local
+                    'edges_local': edges_local,
+                    'pose': (pose_yaw, pose_pitch, pose_roll)
                 })
+        elif detector_model_type == "caffe" and cv2_net is not None:
+            t0 = time.time()
+            blob = cv2.dnn.blobFromImage(cv2.resize(frame, (300,300)), 1.0, (300,300), (104.0,177.0,123.0), swapRB=False, crop=False)
+            cv2_net.setInput(blob)
+            try:
+                dets = cv2_net.forward()
+            except Exception:
+                dets = None
+            infer_ms = (time.time() - t0) * 1000.0
+            if dets is not None:
+                for i in range(0, dets.shape[2]):
+                    confidence = float(dets[0,0,i,2])
+                    if confidence < CONF_THRESHOLD:
+                        continue
+                    box = dets[0,0,i,3:7] * np.array([frame_w, frame_h, frame_w, frame_h])
+                    sx, sy, ex, ey = box.astype(int)
+                    bw = ex - sx; bh = ey - sy
+                    mx = int(bw * FACE_MARGIN); my = int(bh * FACE_MARGIN)
+                    startX = max(0, sx - mx); startY = max(0, sy - my)
+                    endX = min(frame_w - 1, ex + mx); endY = min(frame_h - 1, ey + my)
+                    if endX - startX < 10 or endY - startY < 10:
+                        continue
+                    roi = frame[startY:endY, startX:endX].copy()
+                    pose_yaw = pose_pitch = pose_roll = 0.0
+                    if use_facemark and facemark is not None:
+                        try:
+                            rect = np.array([[startX, startY, endX - startX, endY - startY]], dtype=np.int32)
+                            ok, shapes = facemark.fit(gray, rect)
+                            if ok and shapes and len(shapes)>0:
+                                lm = shapes[0].reshape(-1,2)
+                                mask_local, edges_local = mask_from_landmarks(lm, (startX,startY,endX,endY))
+                                if mask_local is None:
+                                    mask_local, edges_local = refine_face_mask(roi)
+                                pose_yaw, pose_pitch, pose_roll = estimate_head_pose_from_landmarks(lm, frame.shape, camera_matrix=cam_matrix, dist_coeffs=dist_coeffs)
+                            else:
+                                mask_local, edges_local = refine_face_mask(roi)
+                        except Exception:
+                            mask_local, edges_local = refine_face_mask(roi)
+                    else:
+                        mask_local, edges_local = refine_face_mask(roi)
+                    detections.append({
+                        'box': (startX, startY, endX, endY),
+                        'confidence': confidence,
+                        'mask_local': mask_local,
+                        'edges_local': edges_local,
+                        'pose': (pose_yaw, pose_pitch, pose_roll)
+                    })
+        else:
+            pass
 
-        # ---- matching using predicted bboxes ----
         mapping = match_detections_to_tracks(detections, tracks)
         used_track_ids = set()
         for d_idx, det in enumerate(detections):
             tid = mapping[d_idx]
             if tid is None:
                 new_tid = update_or_create_track(None, det, frame_h, frame_w)
+                tracks[new_tid]['pose'] = det.get('pose', (0.0,0.0,0.0))
                 used_track_ids.add(new_tid)
             else:
                 update_or_create_track(tid, det, frame_h, frame_w)
+                tracks[tid]['pose'] = det.get('pose', (0.0,0.0,0.0))
                 used_track_ids.add(tid)
-        # increment last_seen for unmatched tracks
         for tid in list(tracks.keys()):
             if tid not in used_track_ids:
                 tracks[tid]['last_seen'] += 1
 
-    # Now render output by applying averaged masks from tracks with sepia blending
+    # render sepia masked output and HUD
     output = frame.copy().astype(np.uint8)
-
-    # Precompute sepia version of the whole frame for blending
     sepia_frame = apply_sepia_to_frame(frame)
 
-    # optional logging: write current track positions for gimbal control
-    if LOG_ENABLED and log_writer is not None and frame_idx is not None:
-        ts = datetime.now(timezone.utc).isoformat()
+    ts = datetime.now(timezone.utc).isoformat()
+    if LOG_ENABLED and (frame_idx is not None):
+        track_list_for_udp = []
         for tid, tr in list(tracks.items()):
             sx, sy, ex, ey = tr['bbox_smoothed']
             sx_i, sy_i, ex_i, ey_i = int(sx), int(sy), int(ex), int(ey)
             w = max(0, ex_i - sx_i)
             h = max(0, ey_i - sy_i)
-            cx = sx_i + w // 2
-            cy = sy_i + h // 2
+            cx = sx_i + w//2
+            cy = sy_i + h//2
             conf = tr.get('confidence', 0.0)
-            log_writer.writerow([
-                ts, frame_idx, tid, sx_i, sy_i, ex_i, ey_i, cx, cy, w, h, float(conf), int(frozen_flag)
-            ])
-        try:
-            # ensure it's flushed to disk for real-time gimbal control
-            log_file.flush()
-            os.fsync(log_file.fileno())
-        except Exception:
-            pass
+            yaw_p, pitch_p, roll_p = tr.get('pose', (0.0,0.0,0.0))
+            # CSV log row (append)
+            try:
+                with open(LOG_PATH, "a", newline="") as lf:
+                    lw = csv.writer(lf)
+                    lw.writerow([ts, frame_idx, tid, sx_i, sy_i, ex_i, ey_i, cx, cy, w, h, float(conf), float(yaw_p), float(pitch_p), float(roll_p), int(frozen_flag)])
+            except Exception:
+                pass
+            track_list_for_udp.append({
+                "id": int(tid),
+                "cx": int(cx),
+                "cy": int(cy),
+                "w": int(w),
+                "h": int(h),
+                "conf": float(conf),
+                "pose_yaw_deg": float(yaw_p),
+                "pose_pitch_deg": float(pitch_p),
+                "pose_roll_deg": float(roll_p),
+                "frozen": int(frozen_flag)
+            })
+        # send UDP
+        if UDP_ENABLED and udp_sock is not None:
+            payload = {"ts": ts, "frame_idx": int(frame_idx or -1), "tracks": track_list_for_udp}
+            try:
+                udp_sock.sendto(json.dumps(payload).encode('utf-8'), (UDP_HOST, UDP_PORT))
+            except Exception:
+                pass
 
+    # rendering for each track with overlay (yaw/pitch) and small yaw arrow
     for tid, tr in list(tracks.items()):
         if len(tr['masks']) == 0:
             continue
@@ -816,133 +1133,130 @@ def process_and_draw(frame, net, cascade, use_haar, frozen_flag=False, log_write
         avg_edges = np.mean(np.stack(list(tr['edges']), axis=0), axis=0)
         edges_bin = (avg_edges > 100).astype(np.uint8)
 
-        # blend sepia_frame and output based on alpha
-        blended = (sepia_frame.astype(np.float32) * alpha + output.astype(np.float32) * (1.0 - alpha)).astype(np.uint8)
-
-        # edge overlay (green-ish)
-        edge_color = np.zeros_like(output)
-        edge_color[edges_bin > 0] = (10, 255, 10)
-        blended_with_edges = cv2.addWeighted(blended, 1.0, edge_color, 0.8, 0)
-
-        mask_bool = (avg_mask > 10)
-        mask3 = np.repeat(mask_bool[:, :, np.newaxis], 3, axis=2)
-        output[mask3] = blended_with_edges[mask3]
+        if tr.get('mask_enabled', False):
+            blended = (sepia_frame.astype(np.float32) * alpha + output.astype(np.float32) * (1.0 - alpha)).astype(np.uint8)
+            edge_color = np.zeros_like(output)
+            edge_color[edges_bin > 0] = (10, 255, 10)
+            blended_with_edges = cv2.addWeighted(blended, 1.0, edge_color, 0.8, 0)
+            mask_bool = (avg_mask > 10)
+            mask3 = np.repeat(mask_bool[:, :, np.newaxis], 3, axis=2)
+            output[mask3] = blended_with_edges[mask3]
 
         sx, sy, ex, ey = tr['bbox_smoothed']
         sx, sy, ex, ey = int(sx), int(sy), int(ex), int(ey)
         cv2.rectangle(output, (sx, sy), (ex, ey), (10, 255, 10), 1)
-        label = f"face (id={tid}) {tr.get('confidence',0)*100:.0f}%"
-        y = sy - 8 if sy - 8 > 8 else sy + 12
-        cv2.putText(output, label, (sx, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (10, 255, 10), 1)
+
+        # overlay: small filled rect above bbox with yaw/pitch text
+        yaw_p, pitch_p, roll_p = tr.get('pose', (0.0,0.0,0.0))
+        overlay_text = f"Yaw:{yaw_p:+.1f}°  Pitch:{pitch_p:+.1f}°"
+        # calculate overlay pos (above bbox if space, else below)
+        oy = sy - 18 if sy - 18 > 8 else ey + 12
+        ox = sx
+        # background rectangle
+        (tw, th), _ = cv2.getTextSize(overlay_text, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+        cv2.rectangle(output, (ox-2, oy-14), (ox + tw + 4, oy + 2), (0, 0, 0), thickness=-1)
+        cv2.putText(output, overlay_text, (ox, oy), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 220, 20), 1, cv2.LINE_AA)
+
+        # small yaw arrow: from bbox center draw a short horizontal line left/right according to yaw sign
+        cx = sx + (ex - sx)//2
+        cy = sy + (ey - sy)//2
+        # yaw->pixel mapping: assumes a small scale (5 px per degree) clipped to bbox width/4
+        scale = 4.0
+        dx = int(clamp(yaw_p * scale, - (ex - sx)//4, (ex - sx)//4))
+        x2 = cx + dx
+        y2 = cy
+        cv2.arrowedLine(output, (cx, cy), (x2, y2), (200,200,50), 2, tipLength=0.3)
+
+        label = f"id={tid} conf={tr.get('confidence',0):.2f}"
+        ylab = sy - 28 if sy - 28 > 8 else sy + 28
+        cv2.putText(output, label, (sx, ylab), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (10,255,10), 1)
 
     garbage_collect_tracks()
+
+    # HUD: update and draw
+    now = time.time()
+    elapsed = now - start_t
+    if elapsed > 0:
+        frame_proc_fps = 1.0 / elapsed
+        _proc_fps = HUD_ALPHA * _proc_fps + (1.0 - HUD_ALPHA) * frame_proc_fps if _proc_fps > 0 else frame_proc_fps
+    _avg_infer_ms = HUD_ALPHA * _avg_infer_ms + (1.0 - HUD_ALPHA) * infer_ms if _avg_infer_ms > 0 else infer_ms
+    num_tracks = len(tracks)
+    draw_hud(output, _stream_fps, _proc_fps, _avg_infer_ms, num_tracks)
+
+    _prev_gray = gray.copy()
     return output
 
-
 def main():
-    global frozen
-    # ensure DNN model files (attempt download if missing)
-    dnn_ok = False
+    global frozen, onnx_session, cv2_net, detector_model_type, _stream_fps
+    # model files
     if not (os.path.exists(PROTOTXT) and os.path.exists(CAFFEMODEL)):
-        print("DNN model files not found locally. Attempting to download...")
-        dnn_ok = ensure_model_files()
-    else:
-        dnn_ok = True
+        print("trying to download Caffe model files...")
+        ensure_model_files()
 
-    net = None
-    model_type = None
-    if dnn_ok:
-        net, model_type = load_dnn_detector()
+    onnx_session, cv2_net, detector_model_type = load_detector_with_onnx_fallback()
+    if detector_model_type is None:
+        print("No detector available.")
+        sys.exit(1)
+    print("Using detector:", detector_model_type)
+    if detector_model_type == "onnx_runtime" and ort is not None:
+        print("ONNX providers:", ort.get_available_providers())
 
-    if net is not None:
-        configure_dnn_backend(net)
-
-    use_haar = False
-    cascade = None
-    if net is None:
-        print("Using Haar cascade fallback (not a CNN).")
-        cascade = load_haar_detector()
-        if cascade is None or cascade.empty():
-            print("Error: Haar cascade not available. Please install OpenCV correctly.")
-            sys.exit(1)
-        use_haar = True
-    else:
-        print(f"Using DNN face detector ({model_type}).")
-
-    # try facemark
     try_load_facemark()
 
-    # prepare CSV logging
-    log_file = None
-    log_writer = None
-    if LOG_ENABLED:
-        try:
-            is_new = not os.path.exists(LOG_PATH)
-            log_file = open(LOG_PATH, "a", newline="")
-            log_writer = csv.writer(log_file)
-            if is_new:
-                log_writer.writerow([
-                    "timestamp_utc_iso", "frame_idx", "track_id",
-                    "x1", "y1", "x2", "y2", "centroid_x", "centroid_y",
-                    "width", "height", "confidence", "frozen_flag"
-                ])
-                log_file.flush()
-            print(f"Logging tracks to {LOG_PATH}")
-        except Exception as e:
-            print(f"Failed to open log file {LOG_PATH}: {e}")
-            log_file = None
-            log_writer = None
-
-    print(f"Attempting to open stream: {VIDEO_SOURCE}")
-
-    # start threaded MJPEG stream
-    stream = MJPEGStream(VIDEO_SOURCE, timeout=10, reconnect_delay=1.0)
+    print("Starting stream:", VIDEO_SOURCE)
+    stream = MJPEGStream(VIDEO_SOURCE, timeout=10)
     stream.start()
 
-    # wait a short while for the stream to produce frames, otherwise fallback to snapshot polling
-    use_snapshot_fallback = False
-    first_wait_start = time.time()
+    # allow a short warmup for stream
+    first_wait = time.time()
     first_frame = None
-    while time.time() - first_wait_start < 2.5:
+    while time.time() - first_wait < 2.5:
         first_frame = stream.read()
         if first_frame is not None:
             break
         time.sleep(0.05)
+    use_snapshot = False
     if first_frame is None:
-        print("MJPEG stream did not produce frames — falling back to snapshot polling.")
-        use_snapshot_fallback = True
+        print("Stream empty, falling back to snapshot polling.")
+        use_snapshot = True
     else:
-        print("MJPEG stream active (threaded reader) — using stream frames.")
-        use_snapshot_fallback = False
+        print("Stream OK.")
+        use_snapshot = False
 
     frame_idx = 0
+    cam_matrix = None
+    dist_coeffs = None
+
     try:
         while True:
-            if use_snapshot_fallback:
-                frame = grab_snapshot_frame(SNAPSHOT_URL)
+            if use_snapshot:
+                frame = None
+                try:
+                    frame = grab_snapshot_frame(SNAPSHOT_URL)
+                except Exception:
+                    frame = None
                 if frame is None:
-                    # keep trying stream as well in case it recovers
                     maybe = stream.read()
                     if maybe is not None:
-                        frame = maybe
-                        use_snapshot_fallback = False
-                        print("MJPEG stream recovered — switching back to stream.")
+                        frame = maybe; use_snapshot = False
                     else:
-                        time.sleep(0.03)
+                        time.sleep(0.02)
                         continue
             else:
                 frame = stream.read()
                 if frame is None:
-                    # stream dropped; switch to snapshot fallback but keep trying to reconnect in background
-                    print("Stream dropped or no frame received — switching to snapshot fallback.")
-                    use_snapshot_fallback = True
+                    print("Stream dropped; switching to snapshot.")
+                    use_snapshot = True
                     continue
 
-            out = process_and_draw(frame, net, cascade, use_haar, frozen_flag=frozen,
-                                   log_writer=log_writer, log_file=log_file, frame_idx=frame_idx)
-            frame_idx += 1
+            _stream_fps = stream.fps() or _stream_fps
 
-            title = "Face Detector - Live (f:freeze, c:clear, s:save, q:quit)"
+            t0 = time.time()
+            out = process_and_draw(frame, frozen_flag=frozen, frame_idx=frame_idx, cam_matrix=cam_matrix, dist_coeffs=dist_coeffs)
+            infer_latency = (time.time() - t0) * 1000.0
+
+            frame_idx += 1
+            title = "Face Detector (hud: stream/proc/infer) - f:freeze, c:clear, s:save, q:quit"
             if frozen:
                 title += " [FROZEN]"
             cv2.imshow(title, out)
@@ -953,28 +1267,27 @@ def main():
             elif key == ord("s"):
                 fname = f"snapshot_{int(time.time())}.jpg"
                 cv2.imwrite(fname, out)
-                print(f"Saved {fname}")
+                print("Saved", fname)
             elif key == ord("f"):
                 frozen = not frozen
-                print("Frozen." if frozen else "Unfrozen, resuming detection.")
+                print("Frozen." if frozen else "Unfrozen.")
             elif key == ord("c"):
                 tracks.clear()
-                print("Cleared all tracks.")
+                print("Tracks cleared.")
 
     finally:
-        # stop threaded stream
         try:
             stream.stop()
         except Exception:
             pass
         cv2.destroyAllWindows()
-        if log_file is not None:
+        if udp_sock is not None:
             try:
-                log_file.close()
+                udp_sock.close()
             except Exception:
                 pass
 
-
 if __name__ == "__main__":
     main()
+
 
