@@ -86,7 +86,7 @@ def send_command_udp(sock, addr, yaw_cmd_deg, pitch_cmd_deg):
     msg = f"{yaw_cmd_deg:.3f},{pitch_cmd_deg:.3f}"
     sock.sendto(msg.encode("ascii"), addr)
 
-# -------------------- CSV tailer (unchanged) --------------------
+# -------------------- CSV tailer --------------------
 def tail_csv_realtime(csv_path, on_new_rows, poll_sleep=READ_LOOP_SLEEP):
     last_size = 0
     with open(csv_path, "r", newline="") as f:
